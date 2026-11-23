@@ -3402,6 +3402,13 @@ def main():
     if "--say" in sys.argv:                          # test the voice
         Voice().say(sys.argv[sys.argv.index("--say") + 1]); return
 
+    if "--verify-skills" in sys.argv:                # trust all current skills (run from the keyboard only)
+        from skills import SkillBook
+        book = SkillBook(SKILLS_DIR, SKILLS_VERIFIED, HERE / ".venv" / "Scripts" / "python.exe", lambda m: None)
+        for s, state in book.verify_all():
+            print(f"{s.id:24} {state}")
+        return
+
     if "--screens" in sys.argv:                      # test multi-monitor capture
         for p, d in capture_all_screens():
             print(p, "|", d)

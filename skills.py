@@ -281,7 +281,31 @@ class SkillBook:
         return None
 
     def is_verified(self, s: Skill) -> bool:
+        try:                                            # `hey_claude.py --verify-skills` may have updated it
+            mt = self.verified_file.stat().st_mtime
+            if mt != getattr(self, "_vmtime", None):
+                self._vmtime = mt
+                self.verified = json.loads(self.verified_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
         return bool(s.digest) and self.verified.get(s.id) == s.digest
+
+    def verify_all(self):
+        """Trust every skill as it is right now (digest of skill.json + scripts), WITHOUT running any.
+        Blocked skills are skipped; approval skills still ask first at run time. Any later change to a
+        skill's files changes its digest, so it's untrusted again until verified."""
+        report = []
+        for s in self.load():
+            if s.blocked:
+                report.append((s, "skipped: " + s.blocked))
+            elif s.approval:
+                report.append((s, "asks first every time (" + (s.approval_reason or "marked approval") + ")"))
+            elif self.is_verified(s):
+                report.append((s, "already verified"))
+            else:
+                self.mark_verified(s)
+                report.append((s, "verified: runs instantly now"))
+        return report
 
     def mark_verified(self, s: Skill):
         with self.lock:

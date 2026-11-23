@@ -234,7 +234,11 @@ first, then set `"enabled": false` (reversible) rather than deleting it.
 else. A skill that is new or was just changed is NOT run by itself the first
 time: you get the command with a note telling you to run it once with the
 exact command line; do exactly that, check the result, and reply. After that
-it runs instantly. If a skill fails, is disabled, or needs approval, you get
+it runs instantly. The user can also trust all current skills at once from
+the keyboard with `hey_claude.py --verify-skills` (it runs none of them;
+there is no voice command for this on purpose). Approval skills, like
+Hibernate, still ask first every time, and any later change to a skill's
+files makes it untrusted again. If a skill fails, is disabled, or needs approval, you get
 the request with a note saying so; follow it (and fix the script if it's a
 simple fix). Never edit `skills-verified.json`.
 

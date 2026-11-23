@@ -110,7 +110,8 @@ like "seventy five" work too). `reply` can use `{output}` (what the script print
 Skills can't get around the safety rules:
 
 - **A new or changed skill is not trusted yet.** Its first run goes through the model's own tools, so Claude Code's
-  permission checks see it. Only then does it run instantly. The trust list lives outside the workspace.
+  permission checks see it. Only then does it run instantly. The trust list lives outside the workspace. To trust every current skill at once after reviewing them yourself, run
+  `hey_claude.py --verify-skills` (it runs none of them; skills that need approval still ask every time).
 - **Anything destructive or outward-facing always asks first.** A static scan forces approval for scripts that
   delete, overwrite, kill, shut down, change settings or send. The model then asks the confirmation question and
   runs the script only after a clear yes.
