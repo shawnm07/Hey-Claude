@@ -94,6 +94,8 @@ F20 or clicks the mic button in the chat (push-to-talk); typing works anytime.
    mouse drops down a pill; hovering it shows the latest messages; clicking
    it, or tapping F20, opens a chat window with the whole conversation, a
    text box, a mic button, Stop, and a gear menu with "New conversation".
+   The chat (by its title bar) and the pill can be dragged anywhere; closing
+   puts them back in the middle.
 7. **Conversation:** spoken and typed commands share context across all
    models until 15 quiet minutes pass or the user presses "New conversation".
    Then every session that took part reviews it to update learned memory.

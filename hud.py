@@ -94,6 +94,13 @@ def _cursor():
     return pt.x, pt.y
 
 
+def _work_area_at(x, y):
+    """Work area of the monitor at this point (or the nearest one)."""
+    mi = _MI(); mi.cbSize = ctypes.sizeof(_MI)
+    _u32.GetMonitorInfoW(_u32.MonitorFromPoint(wt.POINT(int(x), int(y)), 2), ctypes.byref(mi))
+    return mi.rcWork
+
+
 def _last_input():
     li = _LII(ctypes.sizeof(_LII), 0); _u32.GetLastInputInfo(ctypes.byref(li))
     return li.dwTime
@@ -267,6 +274,7 @@ class Hud:
         self.sb_seen, self.sb_drag = 0.0, None
         self.prev_loaded, self.sent, self.sent_i = None, [], None
         self.err_t = 0.0
+        self.drag, self.pill_pos, self.chat_pos = None, None, None   # dragged positions (reset on close / hide)
         self._activity_baseline()
         if chatlog is not None:
             try:
@@ -345,8 +353,14 @@ class Hud:
             b.bind("<Button-1>", lambda e, a=action: (self._act(a), "break")[1])
         self.btns.grid_remove()
         for widget in (fr, self.title, self.detail, self.dot):
-            widget.bind("<Button-1>", self._pill_click)
+            self._bind_pill(widget)
             widget.configure(cursor="hand2")
+
+    def _bind_pill(self, widget):
+        """Click = open the chat; press and drag = move the pill."""
+        widget.bind("<ButtonPress-1>", lambda e: self._drag_start("pill"))
+        widget.bind("<B1-Motion>", lambda e: self._drag_move())
+        widget.bind("<ButtonRelease-1>", lambda e: self._drag_end())
 
     def _build_preview(self):
         p = self.prev_fr = tk.Frame(self.win, bg=self.BG, cursor="hand2")
@@ -357,7 +371,7 @@ class Hud:
                                   bg=self.BG, cursor="hand2")
         self.prev_foot.pack(pady=(4, 12))
         for wdg in (p, self.prev_rows, self.prev_foot):
-            wdg.bind("<Button-1>", self._pill_click)
+            self._bind_pill(wdg)
 
     def _fill_preview(self, width):
         for c in self.prev_rows.winfo_children():
@@ -369,7 +383,7 @@ class Hud:
         if not last:
             lbl = tk.Label(self.prev_rows, text="No messages yet. Click to start a chat.", font=self.f_small,
                            fg=self.SUB, bg=self.BG, cursor="hand2")
-            lbl.pack(anchor="w"); lbl.bind("<Button-1>", self._pill_click)
+            lbl.pack(anchor="w"); self._bind_pill(lbl)
             return
         for m in last:
             row = tk.Frame(self.prev_rows, bg=self.BG, cursor="hand2")
@@ -385,7 +399,7 @@ class Hud:
                            justify="left", anchor="w", wraplength=wrap, cursor="hand2")
             txt.pack(side="left", fill="x")
             for wdg in (row, who, txt):
-                wdg.bind("<Button-1>", self._pill_click)
+                self._bind_pill(wdg)
 
     # ============================================================ building: chat window
     def _icon_btn(self, parent, glyph, fn, fg=None, font=None):
@@ -405,7 +419,8 @@ class Hud:
         self.hdot = tk.Canvas(h, width=px(12), height=px(12), bg=self.BG, highlightthickness=0)
         self.hdot.pack(side="left", padx=(px(18), px(10)))
         self.hdot_id = self.hdot.create_oval(px(1), px(1), px(11), px(11), fill=self.ACCENT, outline="")
-        tk.Label(h, text="Hey Claude", font=self.f_head, fg=self.FG, bg=self.BG).pack(side="left")
+        self.htitle = tk.Label(h, text="Hey Claude", font=self.f_head, fg=self.FG, bg=self.BG)
+        self.htitle.pack(side="left")
         self.hstatus = tk.Label(h, text="Ready", font=self.f_small, fg=self.SUB, bg=self.BG)
         self.hstatus.pack(side="left", padx=(px(10), 0), pady=(px(2), 0))
         self.b_close = self._icon_btn(h, ICON["close"], self.close_chat)
@@ -508,8 +523,11 @@ class Hud:
                 wdg.bind("<Enter>", lambda e, ps=parts: [p.config(bg=self.HOVER) for p in ps])
                 wdg.bind("<Leave>", lambda e, ps=parts: [p.config(bg=self.PANEL) for p in ps])
                 wdg.bind("<Button-1>", lambda e, fn=fn: (fn(), "break")[1])
-        for wdg in (self.header, self.hstatus):
-            wdg.bind("<Button-1>", lambda e: self._close_menu())
+        # the header is the title bar: press and drag it to move the chat window (like any app)
+        for wdg in (self.header, self.hstatus, self.htitle, self.hdot):
+            wdg.bind("<ButtonPress-1>", lambda e: (self._close_menu(), self._drag_start("chat")))
+            wdg.bind("<B1-Motion>", lambda e: self._drag_move())
+            wdg.bind("<ButtonRelease-1>", lambda e: self._drag_end())
 
     # ============================================================ composer
     def _inp_text(self):
@@ -1330,6 +1348,7 @@ class Hud:
         self.visible = False
         self.mode, self.peek, self.expanded = "hidden", False, False
         self.hide_at, self.lingering = None, False
+        self.pill_pos = self.chat_pos = None           # next time: back in the middle
         self.pill_fr.place_forget(); self.prev_fr.place_forget(); self.chat_fr.place_forget()
         self._apply_geo((-20000, -20000, 10, 10), 0.0)
 
@@ -1355,8 +1374,11 @@ class Hud:
             eh = self.prev_fr.winfo_reqheight()
         self.pill_dims = (pw, ph, eh)
         mon, work = _primary()
-        x = work.left + (work.right - work.left - pw) // 2
-        return (x, work.top + self.px(10), pw, ph + eh), (x, mon.top - ph - eh - 8, pw, ph + eh)
+        x, y = work.left + (work.right - work.left - pw) // 2, work.top + self.px(10)
+        if self.pill_pos is not None:                  # you dragged it: stay there until it hides
+            x, y = self.pill_pos
+            mon = _work_area_at(x + pw // 2, y)
+        return (x, y, pw, ph + eh), (x, mon.top - ph - eh - 8, pw, ph + eh)
 
     def _pill_show(self):
         """Show / update the pill (slides down from the top edge when it wasn't visible)."""
@@ -1406,6 +1428,40 @@ class Hud:
         self.open_chat()
         return "break"
 
+    # ---- dragging (chat header, pill): stays where you put it until the chat closes / the pill hides
+    def _drag_start(self, kind):
+        if self.anim is not None or (kind == "chat") != (self.mode == "chat"):
+            self.drag = {"kind": kind, "skip": True}
+            return
+        cx, cy = _cursor()
+        self.drag = {"kind": kind, "cx": cx, "cy": cy, "x": self.geo[0], "y": self.geo[1], "moved": False}
+
+    def _drag_move(self):
+        d = self.drag
+        if not d or d.get("skip"):
+            return
+        cx, cy = _cursor()
+        dx, dy = cx - d["cx"], cy - d["cy"]
+        if not d["moved"] and abs(dx) + abs(dy) < self.px(4):
+            return                                     # a click, not a drag (yet)
+        d["moved"] = True
+        w, h = self.geo[2], self.geo[3]
+        work = _work_area_at(cx, cy)
+        x = max(work.left - w + self.px(80), min(d["x"] + dx, work.right - self.px(80)))   # keep it reachable
+        y = max(work.top, min(d["y"] + dy, work.bottom - self.px(40)))
+        self._apply_geo((x, y, w, h))
+        if d["kind"] == "chat":
+            self.chat_pos = (x, y)
+        else:
+            self.pill_pos = (x, y)
+
+    def _drag_end(self):
+        d, self.drag = self.drag, None
+        if d and d["kind"] == "pill" and not d.get("skip") and not d.get("moved"):
+            self._pill_click()                         # it was a click: open the chat
+        elif d and d["kind"] == "pill" and d.get("skip") and self.mode == "pill":
+            self._pill_click()
+
     def _cursor_in(self, g, margin=0):
         x, y = _cursor()
         return g[0] - margin <= x < g[0] + g[2] + margin and g[1] - margin <= y < g[1] + g[3] + margin
@@ -1422,6 +1478,14 @@ class Hud:
         mon, work = _primary()
         tx = work.left + (work.right - work.left - self.CW) // 2
         target = (tx, work.top + self.px(10), self.CW, self.CH)
+        if self.mode == "pill" and self.visible and self.pill_pos is not None:
+            # the pill was dragged somewhere: open the chat right there (until it's closed)
+            g = self.geo
+            wa = _work_area_at(g[0] + g[2] // 2, g[1])
+            x = max(wa.left, min(g[0] + g[2] // 2 - self.CW // 2, wa.right - self.CW))
+            y = max(wa.top, min(g[1], wa.bottom - self.CH))
+            target = (x, y, self.CW, self.CH)
+            self.chat_pos = (x, y)
         if self.mode == "pill" and self.visible:
             start = self.geo
         else:
@@ -1446,6 +1510,8 @@ class Hud:
             return
         self._close_menu()
         self.chat_open = False
+        self.drag = None
+        self.chat_pos = self.pill_pos = None           # closed: back to the middle next time
         self._release_focus()
         mon, work = _primary()
         pw, ph = self.px(360), self.px(56)
@@ -1621,7 +1687,10 @@ class Hud:
                 if self._handle(msg) == "quit":
                     return
             busy |= self._step_anim(now)
-            if self.anim is None:
+            dragging = self.drag is not None and not self.drag.get("skip")
+            if dragging:
+                busy = True                            # smooth while you drag; no hover / hide logic meanwhile
+            elif self.anim is None:
                 if self.mode == "hidden":
                     self._edge_logic(now)
                 elif self.mode == "pill":
@@ -1727,7 +1796,8 @@ class Hud:
             self.toast_until = 0.0
             self.toast_lbl.place_forget()
         # docked / undocked while open: keep it centered on the primary screen
-        if int(now) != getattr(self, "_geo_check", 0) and self.anim is None:
+        if (int(now) != getattr(self, "_geo_check", 0) and self.anim is None and self.chat_pos is None
+                and self.drag is None):
             self._geo_check = int(now)
             mon, work = _primary()
             tx = work.left + (work.right - work.left - self.CW) // 2

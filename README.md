@@ -57,7 +57,8 @@ conversation, or hold **F20** to talk.
 | Say **"Hey Claude"** with the chat open | The text box becomes a listening panel, then your words and the reply land in the chat |
 | **Stop** under "Working…" | Abandons the request. The model restarts fresh but keeps the conversation as context. |
 | Gear ⚙ → **New conversation** | Starts a new log. The old one is kept, and memories and settings carry over. |
-| **X**, **Esc** or **F20** | Closes the chat. It otherwise stays on top while you work. |
+| Drag the chat's **title bar**, or drag the **pill** | Moves it anywhere, like a normal window. A click on the pill still opens the chat (right where you moved it). |
+| **X**, **Esc** or **F20** | Closes the chat and puts it (and the pill) back in the middle. Otherwise it stays on top while you work. |
 
 Each message has a copy button (or right-click it). At the top of the chat you can load the previous
 conversation.

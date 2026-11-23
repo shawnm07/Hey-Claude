@@ -96,7 +96,7 @@ MIN_UTTER_S = 0.5
 PRE_ROLL_S = 0.4
 WAKE_CHECK_S = 2.5             # utterances longer than SINGLE_PASS_S: check only the start first
 SINGLE_PASS_S = 6.0
-FOLLOWUP_S = 6.0               # after a bare "Hey Claude", time to START the command
+FOLLOWUP_S = 9.0               # after a bare "Hey Claude", time to START the command (was 6: too short)
                                # (answer window after a question: settings' answer_window_seconds)
 FAST_WAKE_MODEL = "tiny.en"              # tiny, ~0.15 s per check: only used to SPOT "Hey Claude" quickly
 EARLY_WAKE_AT_S = (0.8, 1.0, 1.3, 1.7, 2.2)   # while you talk, check for "Hey Claude" at these points
@@ -208,6 +208,11 @@ def continue_s() -> float:
     return max(0.2, settings()["pause_allowed_seconds"] - END_SILENCE_S)
 
 HOTWORDS = "Hey Claude. Chrome, Spotify, Discord, TickTick, Calculator, Settings, Wi-Fi, hotspot, volume"
+
+# small.en sometimes mishears a paused "Hey Claude." as "Tick Claude." / "8 Claude.": one short word + Claude,
+# at the very start. Only used to confirm a wake word the fast spotter already heard.
+NEAR_WAKE_RE = re.compile(r"^\W*(?:[\w']{1,7}[\s,.!-]+)?(?:claude|claud|cloud|clod|clawed|claw|klaud|clyde)\b"
+                          r"[\s,.!?-]*", re.I)
 
 WAKE = re.compile(
     r"\b(?:hey|hi|hay|heh|okay|ok)[\s,.!-]*"
@@ -369,17 +374,22 @@ def voice_features(audio: np.ndarray):
 
 
 def sounds_like_someone_else(ref, new) -> bool:
-    """Roommates are usually farther from the mic (much quieter) and/or have a different pitch."""
+    """Fallback when voice match isn't set up: roommates are usually much farther from the mic.
+    Loosened (2026-11-23): the old version cut the owner off mid-command 7 times in one day, always from
+    pitch-tracker octave errors on their own voice (92 Hz read as 231, 163 as 400). Pitch now only counts
+    together with a clear loudness drop, and octave-like jumps are ignored."""
     if not ref or not new:
         return False
     drop = ref[0] - new[0]                            # how much quieter than your "Hey Claude", in dB
-    if drop >= 7.0:                                   # much quieter: farther from the mic
+    if drop >= 10.0:                                  # much quieter: across the room
         return True
-    if ref[1] and new[1]:
+    if ref[1] and new[1] and drop >= 4.0:
+        if not (78 < ref[1] < 390 and 78 < new[1] < 390):
+            return False                              # pinned at the 75-400 Hz search limits: not a real reading
         ratio = new[1] / ref[1]
-        if ratio < 0.78 or ratio > 1.28:              # clearly different voice pitch
-            return True
-        if drop >= 4.0 and (ratio < 0.87 or ratio > 1.15):   # somewhat quieter AND somewhat different
+        if any(abs(ratio - k) < 0.18 * k for k in (0.5, 2.0, 3.0)):
+            return False                              # octave error of the pitch tracker, not another person
+        if ratio < 0.7 or ratio > 1.45:
             return True
     return False
 
@@ -2145,6 +2155,8 @@ class Listener:
         kind = p["kind"] if p else ("open" if self.open_until else "wake")
         if not text and (self.in_speech or p):
             return                                     # still mid-word: decide at the end instead
+        if not text and self.followup_until:
+            return                                     # you haven't started the command yet: that window decides
         ok, reason = self.judge(text, asr, snr, kind)
         if not ok:
             self.false_wake(f"4 s check: {reason}", text)
@@ -2277,7 +2289,8 @@ class Listener:
     def check_early_wake(self):
         """Called while you're still talking: if the start of what you've said so far is
         'Hey Claude', chime and show 'Listening…' immediately instead of waiting for you to finish."""
-        if (not self.wake_on or self.early_wake is not None or self.early_i >= len(EARLY_WAKE_AT_S)
+        if (not self.wake_on or self.enroll is not None or self.early_wake is not None
+                or self.early_i >= len(EARLY_WAKE_AT_S)
                 or self.pending or self.answer_until or self.followup_until or self.open_until):
             return
         if len(self.buf) * FRAME_S < EARLY_WAKE_AT_S[self.early_i]:
@@ -2412,7 +2425,9 @@ class Listener:
         if self.pending:
             if start <= self.pending_deadline + 0.1:
                 owner, sc = self.owner_check(audio)
-                if owner is False or (owner is None and sounds_like_someone_else(self.pending.get("voice"), voice)):
+                enrolled = self.voiceid is not None and self.voiceid.enrolled and settings()["voice_match"]
+                # voice match set up: trust only it (too little speech to judge = still you)
+                if owner is False or (not enrolled and sounds_like_someone_else(self.pending.get("voice"), voice)):
                     why = f"voice match {sc:.2f}" if owner is False else f"you {self.pending.get('voice')}, now {voice}"
                     log(f"Sounds like someone else talking ({why}); not adding it, sending your command.")
                     self.run_pending()                 # stop listening; their words are dropped
@@ -2492,12 +2507,22 @@ class Listener:
                 return
             text = self.transcribe(audio)
             m = WAKE.search(text)
-            if not m:                                  # the accurate model didn't hear "Hey Claude": noise
-                self.false_wake("wake word not confirmed", text)
-                return
+            after = text[m.end():] if m else None
+            if after is None:
+                near = NEAR_WAKE_RE.match(text)
+                if near:                               # "Tick Claude." / "8 Claude.": a misheard "Hey Claude"
+                    log(f"Wake word near-miss accepted ({text!r}; spotter fired"
+                        f"{', voice matches' if owner else ''}).")
+                    after = text[near.end():]
+                elif owner is True:                    # your voice, wake phrase garbled: wait for the command
+                    log(f"Wake word unclear ({text!r}) but it's your voice: waiting for the command.")
+                    after = ""
+                else:                                  # the accurate model didn't hear "Hey Claude": noise
+                    self.false_wake("wake word not confirmed", text)
+                    return
             chime()                                    # confirmed
             self.voice.warm(20)                        # wake the Bluetooth speaker for the reply
-            self.on_wake(text[m.end():], t0, shots=ew["shots"])
+            self.on_wake(after, t0, shots=ew["shots"])
             return
 
         # 4) normal: is this "Hey Claude ..."? (not on battery: there the mic only opens for F20)
@@ -3079,7 +3104,8 @@ class Listener:
                 # open-mic window): if it's noise, gibberish or roommates, cancel silently right then.
                 if self.open_until and self.in_speech and not self.wake_at and self.utter_start <= self.open_until:
                     self.wake_at, self.wake_judged = self.utter_start, False
-                if self.wake_at and not self.wake_judged and not self.speaking and now - self.wake_at >= 4.0:
+                if (self.wake_at and not self.wake_judged and not self.speaking and self.enroll is None
+                        and now - self.wake_at >= 4.0):
                     try:
                         self.evaluate_partial()
                     except Exception as e:
