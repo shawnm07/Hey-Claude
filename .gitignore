@@ -1,0 +1,18 @@
+# Python environment and downloaded models (large; see README for how to get them)
+.venv/
+models/
+voice/
+__pycache__/
+
+# Logs and local backups
+*.log
+backups/
+
+# Private: everything personal stays on this computer and is never published
+workspace/CLAUDE.md
+workspace/memory/
+workspace/conversations/
+workspace/screen/
+workspace/settings.json
+workspace/.approval
+triage/
