@@ -25,8 +25,15 @@ conversation, or hold **F20** to talk.
   "Hey Claude" fast, `small.en` to confirm and transcribe). A chime and a pill appear as soon as it hears you.
   A false-wake filter (loudness, recognizer confidence, plus a tiny Haiku "was that meant for me?" check)
   quietly ignores roommates, videos and noise.
-- **Keep talking.** It keeps collecting your command while you speak. Short pauses are fine. A **check button**
-  sends it now; **X** or Esc cancels.
+- **Keep talking.** It keeps collecting your command while you speak. Pauses are fine, and you have 9 s to start
+  after "Hey Claude". A **check button** sends it now; **X** or Esc cancels.
+- **Ends when *your voice* stops, even with music playing.** End of speech is decided by a voice activity
+  detector ([Silero VAD](https://github.com/snakers4/silero-vad), bundled with faster-whisper), not loudness. On top of
+  that, a frame only counts if it's clearly above the background measured just before you spoke. Music, TV and fans
+  count as silence, and so do sung vocals, which sit at that background level. While it listens, the laptop's
+  volume is ducked to 30% and then restored exactly (crash-safe). Two more safeguards: with voice match, a command
+  ends after 2 s that aren't your voice, and a long command whose last 2 s contain no words ends there. "Hey Claude"
+  said over ongoing music is still spotted.
 - **Instant actions** with no model call (~0.2 s): open/close apps, exact volume, media keys,
   maximize/minimize, the time and date, plus any **script skills** you've taught it (see below).
 - **The right model for the job.** Simple commands go to Haiku. Screen, tasks, calendar and multi-step work
@@ -253,6 +260,7 @@ A few details that took some figuring out:
 | `skills.py` | Script skills: manifests, trigger matching, safety scan, runner, undo |
 | `voiceid.py` | Voice match: Kaldi-style filterbank + WeSpeaker embeddings, enrollment, adaptation |
 | `headsup.py` | Proactive heads-ups: battery, calendar events, due tasks |
+| `audioduck.py` | Turns the laptop's volume down while listening, restores it exactly (crash-safe) |
 | `skills-examples/` | Sample skills, copied to `workspace/skills/` on first run |
 | `approval_gate.py` | Claude Code `PreToolUse` hook that enforces the email-send approval lock |
 | `tools/` | Gmail compose / send helpers (browser only; no email API access) |

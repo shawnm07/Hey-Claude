@@ -92,6 +92,12 @@ START_FRAMES = 5               # 150 ms of sound starts an utterance
 END_SILENCE_S = 0.6            # this much quiet ends one stretch of speech, but a command keeps
                                # collecting if you talk again within settings' pause_allowed_seconds
 MAX_UTTER_S = 30.0
+# End of speech = when YOUR voice stops, even with music / TV / a fan going (2026-11-23):
+VAD_ON = 0.5                   # Silero VAD speech probability that counts as speech (music, fans ~0)
+VOICE_CHECK_EVERY_S = 1.0      # mid-command voice match on the last 1.5 s; 2 misses in a row end it
+STALL_AFTER_S = 5.0            # a command still "going" after this long: every 2 s check the last
+STALL_EVERY_S = 2.0            #   2 s for words (fast model); none = it's just background, end it
+DUCK_LEVEL = 0.3               # while listening, the laptop's volume goes to 30 % of its level
 MIN_UTTER_S = 0.5
 PRE_ROLL_S = 0.4
 WAKE_CHECK_S = 2.5             # utterances longer than SINGLE_PASS_S: check only the start first
@@ -127,6 +133,7 @@ DEFAULT_SETTINGS = {
     "heads_up": True,              # pill-only heads-ups: events, due tasks, low battery
     "heads_up_check_minutes": 60,  # how often TickTick / Calendar are checked (a Sonnet call each time)
     "heads_up_battery_percent": 20,
+    "duck_while_listening": True,  # turn the laptop's audio down while it listens for a command
 }
 CONV_DIR = WORKSPACE / "conversations"   # one .jsonl log per conversation (append-only, never deleted)
 SKILLS_DIR = WORKSPACE / "skills"        # script skills: instant commands the models can create (skills.py)
@@ -135,6 +142,7 @@ SKILL_EXAMPLES = HERE / "skills-examples"         # the workspace, so a model ca
 SPEAKER_MODEL = HERE / "voice" / "speaker" / "voxceleb_resnet34_LM.onnx"   # WeSpeaker voice embeddings
 VOICEPRINT = HERE / "voiceprint.json"            # the owner's voice profile: numbers only, never audio
 HEADSUP_STATE = HERE / "headsup-state.json"      # which heads-ups were already shown
+DUCK_STATE = HERE / "duck-state.json"            # the volume to restore while ducked (crash-safe)
 
 
 class Settings:
@@ -180,7 +188,7 @@ class Settings:
         num("voice_speed", 0.7, 1.6); num("hud_seconds_after_reply", 3, 120)
         num("answer_window_seconds", 3, 30); num("pause_allowed_seconds", 0.8, 4.0)
         num("listen_after_reply_seconds", 0, 10)
-        for key in ("chat_hud", "voice_match", "heads_up"):
+        for key in ("chat_hud", "voice_match", "heads_up", "duck_while_listening"):
             if isinstance(raw.get(key), bool):
                 d[key] = raw[key]
         num("voice_match_threshold", 0.2, 0.8); num("heads_up_check_minutes", 15, 720)
@@ -1798,6 +1806,16 @@ class Listener:
         self.last_asr = {"logprob": 0.0, "nospeech": 0.0, "comp": 0.0}
         self.wake_at, self.wake_judged = 0.0, False    # false-wake check ~4 s after "Hey Claude"
         self.last_emb, self.last_score = None, 0.0     # voice match of the latest stretch of speech
+        # end of speech by voice, not loudness: Silero VAD (bundled with faster-whisper, ~1 ms per frame)
+        self.vad, self.vad_buf, self.vad_p = None, np.zeros(0, np.float32), 0.0
+        try:
+            from faster_whisper.vad import SileroVADModel, get_assets_path
+            self.vad = SileroVADModel(str(Path(get_assets_path()) / "silero_vad_v6.onnx"))
+        except Exception as e:
+            log(f"Voice activity detector unavailable ({e!r}); using loudness for end of speech.")
+        self.floor_at_start, self.vc_next, self.vc_strikes, self.stall_next = 0.0, 0.0, 0, 0.0
+        from audioduck import Ducker
+        self.ducker = Ducker(get_volume, set_volume, DUCK_STATE, DUCK_LEVEL, log)
         self.triage = TriageSession().start()          # "was that meant for me?" (no tools, ~1 s)
         try:
             self.ui.on_action = self._ui_action
@@ -2032,6 +2050,8 @@ class Listener:
         log("Listening (mic open).")
 
     def close(self, why):
+        if self.ducker.ducked:
+            self.ducker.restore()
         if self.stream:
             try:
                 self.stream.stop(); self.stream.close()
@@ -2056,22 +2076,56 @@ class Listener:
         self.buf: list = []
         self.pre = collections.deque(maxlen=int(PRE_ROLL_S / FRAME_S))
 
+    def speech_prob(self, frame) -> float:
+        """Silero VAD: how likely this frame is a voice (speech ~0.8-1; music, TV, fans ~0)."""
+        if self.vad is None:
+            return 1.0
+        self.vad_buf = np.concatenate([self.vad_buf, frame])[-4096:]
+        n = len(self.vad_buf) // 512 * 512
+        if n < 1024:
+            return 0.0
+        try:
+            return float(np.asarray(self.vad(self.vad_buf[-n:])).reshape(-1)[-2:].max())
+        except Exception as e:
+            log(f"Voice activity detector failed ({e!r}); using loudness from now on.")
+            self.vad = None
+            return 1.0
+
     def feed(self, frame):
+        """Voice activity: a stretch of speech starts on voiced sound clearly above the background, and
+        ends after END_SILENCE_S without a VOICE. Steady music, TV or a fan count as silence, so a
+        command ends when you stop talking. (Without the VAD it falls back to loudness only.)"""
         rms = float(np.sqrt(np.mean(frame * frame)))
+        p = self.vad_p = self.speech_prob(frame)
+        voiced = p >= VAD_ON
         if not self.in_speech:
             self.pre.append(frame)
-            if rms > max(self.noise * 3.0, MIN_LEVEL):
+            # the background (music, room) right before you speak sets the bar: with the VAD, a voice only
+            # has to be 1.5x louder than it; without, any sound 3x louder counts
+            bar = 3.0 if self.vad is None else (1.25 if p >= 0.8 else 1.5)   # a clear voice needs less
+            loud = rms > max(self.noise * bar, MIN_LEVEL)
+            if loud and voiced:
                 self.above += 1
                 if self.above >= START_FRAMES:
                     self.in_speech, self.buf, self.silence = True, list(self.pre), 0
                     self.utter_start = time.time() - len(self.pre) * FRAME_S
                     self.early_wake, self.early_i = None, 0
+                    self.floor_at_start = self.noise
+                    self.vc_next, self.vc_strikes = time.time() + 1.5, 0
+                    self.stall_next = time.time() + STALL_AFTER_S
             else:
                 self.above = 0
-                self.noise = 0.97 * self.noise + 0.03 * rms
+                self.noise = 0.97 * self.noise + 0.03 * rms   # learns the background, music included
             return None
         self.buf.append(frame)
-        self.silence = 0 if rms > max(self.noise * 2.0, MIN_LEVEL * 0.6) else self.silence + 1
+        if self.vad is not None:
+            # a voice AND clearly above the background measured before you started: sung vocals in music
+            # sit at that background level (lower still once the music is ducked), your voice is on top of it
+            floor = self.floor_at_start * (DUCK_LEVEL if self.ducker.ducked else 1.0)   # ducked music is quieter
+            speaking = voiced and rms > max(MIN_LEVEL * 0.3, floor * 1.3)
+        else:
+            speaking = rms > max(self.noise * 2.0, MIN_LEVEL * 0.6)
+        self.silence = 0 if speaking else self.silence + 1
         if self.silence * FRAME_S >= END_SILENCE_S or len(self.buf) * FRAME_S >= MAX_UTTER_S:
             audio = np.concatenate(self.buf)
             self.in_speech, self.buf, self.above = False, [], 0
@@ -2099,8 +2153,9 @@ class Listener:
         return voice[0] - 20 * math.log10(max(self.noise, 1e-5))
 
     # ---- false-wake filter: noise, gibberish, or talk that isn't aimed at it -> silently cancel
-    def judge(self, text, asr, snr, kind):
-        """-> (is_real_request, reason). kind: wake | followup | open | answer."""
+    def judge(self, text, asr, snr, kind, owner=None):
+        """-> (is_real_request, reason). kind: wake | followup | open | answer.
+        owner: True when voice match confirmed it's the owner (then distance doesn't matter)."""
         t = (text or "").strip(" ,.!?\"'")
         words = re.findall(r"[A-Za-z0-9']+", t)
         if not words:
@@ -2115,7 +2170,10 @@ class Listener:
         if kind == "answer":
             return True, ""                            # yes/no logic handles answers
         snr_med = float(np.median(snr)) if snr else 30.0
-        if snr_med < 10.0:
+        # "talking right at the laptop?" (roommates across the room are quieter). Your confirmed voice skips
+        # it, and with music / TV raising the background the bar is lower (the VAD already heard a voice).
+        min_snr = 5.0 if (self.vad is not None and self.floor_at_start > MIN_LEVEL) else 10.0
+        if owner is not True and snr_med < min_snr:
             return False, f"no one talking directly to it (voice only {snr_med:.0f} dB above the room)"
         core = re.sub(r"^(?:and|also|then|now|ok(?:ay)?|oh|actually|wait)[ ,]+", "", t, flags=re.I)
         local_like = bool(LOCAL_HINT_RE.match(core))
@@ -2157,7 +2215,7 @@ class Listener:
             return                                     # still mid-word: decide at the end instead
         if not text and self.followup_until:
             return                                     # you haven't started the command yet: that window decides
-        ok, reason = self.judge(text, asr, snr, kind)
+        ok, reason = self.judge(text, asr, snr, kind, owner=p.get("owner") if p else None)
         if not ok:
             self.false_wake(f"4 s check: {reason}", text)
         elif p:
@@ -2262,13 +2320,15 @@ class Listener:
                         "kind": "answer" if is_answer else kind,
                         "asr": [self.last_asr], "snr": [self.speech_snr(self.last_voice)],
                         "checked": self.manual_listen,  # F20 / mic button: you asked for it, no filter
-                        "emb": self.last_emb, "score": self.last_score}   # voice match of the wake phrase
+                        "emb": self.last_emb, "score": self.last_score,   # voice match of the wake phrase
+                        "owner": getattr(self, "last_owner", None)}
         self.pending_deadline = time.time() + continue_s()
         if not self.wake_at:
             self.wake_at = time.time()
         self.ui.show("listen", "Listening…", f"“{self.pending['text']}”")
 
     def run_pending(self):
+        self.ducker.restore()                          # your volume back before anything runs
         p, self.pending = self.pending, None
         self.wake_at, self.wake_judged = 0.0, False
         self.manual_listen = False
@@ -2276,7 +2336,7 @@ class Listener:
         if not text:
             self.ui.hide(); return
         if not p.get("checked"):                       # false-wake filter before doing anything
-            ok, reason = self.judge(text, p["asr"], p["snr"], p["kind"])
+            ok, reason = self.judge(text, p["asr"], p["snr"], p["kind"], owner=p.get("owner"))
             if not ok:
                 self.false_wake(reason, text)
                 return
@@ -2286,20 +2346,92 @@ class Listener:
             v.add_adapt(p["emb"])                      # a confident, real command: keep the voiceprint current
         self.execute(text, p["t0"], shots=p["shots"], force_model=p["force_model"], is_answer=p["is_answer"])
 
+    # ---- ending a command when your voice stops (music / TV / fans can't keep it open)
+    def listening_for_command(self) -> bool:
+        return bool(self.pending is not None or self.early_wake is not None or self.followup_until
+                    or self.answer_until or self.enroll is not None or (self.open_until and self.in_speech))
+
+    def end_utterance_now(self, trim_s, why):
+        """Stop collecting this stretch of speech now, dropping its last `trim_s` (background, not you)."""
+        keep = max(0, len(self.buf) - int(trim_s / FRAME_S))
+        audio = np.concatenate(self.buf[:keep]) if keep else None
+        self.in_speech, self.buf, self.above, self.silence = False, [], 0, 0
+        log(f"Ended the command early: {why}.")
+        if audio is not None and len(audio) / RATE >= MIN_UTTER_S:
+            self.handle(audio)
+        elif self.pending:
+            self.pending_deadline = 0.0                # nothing new: send what was already heard
+
+    def check_voice_continuity(self):
+        """Voice match on the last 1.5 s, once a second while a command is being said: two misses in a
+        row (music with singing, TV, someone else) end it there."""
+        now = time.time()
+        if now < self.vc_next or not self.listening_for_command() or self.enroll is not None:
+            return
+        self.vc_next = now + VOICE_CHECK_EVERY_S
+        if len(self.buf) * FRAME_S < 2.0:
+            return
+        tail = np.concatenate(self.buf[-int(1.5 / FRAME_S):])
+        owner, sc = self.owner_check(tail)
+        self.vc_strikes = self.vc_strikes + 1 if owner is False else 0
+        if self.vc_strikes >= 2:
+            self.end_utterance_now(2.0, f"not your voice for 2 s (voice match {sc:.2f})")
+
+    def check_stall(self):
+        """Fallback (also without voice match): a command that's still 'going' after 5 s but whose last
+        2 s contain no words is just background sound: end it there."""
+        now = time.time()
+        if (now < self.stall_next or not self.listening_for_command() or self.enroll is not None
+                or len(self.buf) * FRAME_S < STALL_AFTER_S):
+            return
+        self.stall_next = now + STALL_EVERY_S
+        tail = np.concatenate(self.buf[-int(2.0 / FRAME_S):])
+        m = self.fast_model
+        segs, _ = m.transcribe(tail, language="en", beam_size=1, vad_filter=True,
+                               condition_on_previous_text=False, without_timestamps=True)
+        words = " ".join(s.text.strip() for s in segs).strip()
+        if not re.findall(r"[A-Za-z0-9']+", words) or HALLUCINATION_RE.match(words.strip(" ,.!?")):
+            self.end_utterance_now(2.0, f"no words in the last 2 s ({words!r})")
+
+    def update_duck(self):
+        """Laptop audio down while it listens for a command; back up right after."""
+        want = settings()["duck_while_listening"] and self.listening_for_command() and not self.speaking
+        if want and not self.ducker.ducked:
+            self.ducker.duck()
+        elif not want and self.ducker.ducked:
+            self.ducker.restore()
+
     def check_early_wake(self):
         """Called while you're still talking: if the start of what you've said so far is
         'Hey Claude', chime and show 'Listening…' immediately instead of waiting for you to finish."""
         if (not self.wake_on or self.enroll is not None or self.early_wake is not None
-                or self.early_i >= len(EARLY_WAKE_AT_S)
                 or self.pending or self.answer_until or self.followup_until or self.open_until):
             return
-        if len(self.buf) * FRAME_S < EARLY_WAKE_AT_S[self.early_i]:
-            return
-        self.early_i += 1
-        head = np.concatenate(self.buf)[: int(EARLY_WAKE_HEAD_S * RATE)]
-        if self.speech_snr(voice_features(head)) < EARLY_WAKE_MIN_SNR_DB:
+        loud_bg = self.vad is not None and self.floor_at_start > MIN_LEVEL   # music / TV in the background
+        min_snr = 6.0 if loud_bg else EARLY_WAKE_MIN_SNR_DB
+        rolling = False
+        if self.early_i >= len(EARLY_WAKE_AT_S):
+            # A long stretch of sound (music with singing, TV) is still "going": "Hey Claude" said in the
+            # middle of it would only be found when it finally ends. Check the latest 2.4 s once a second.
+            now = time.time()
+            if len(self.buf) * FRAME_S < 3.0 or now < getattr(self, "roll_next", 0.0):
+                return
+            self.roll_next, rolling = now + 1.0, True
+            head = np.concatenate(self.buf[-int(EARLY_WAKE_HEAD_S / FRAME_S):])
+        else:
+            if len(self.buf) * FRAME_S < EARLY_WAKE_AT_S[self.early_i]:
+                return
+            self.early_i += 1
+            head = np.concatenate(self.buf)[: int(EARLY_WAKE_HEAD_S * RATE)]
+        if self.speech_snr(voice_features(head)) < min_snr:
             return                                    # too faint to be someone at the laptop
-        if self.spot_wake(head, at_start=True):
+        if self.spot_wake(head, at_start=not rolling):
+            if rolling:                               # start this command at the wake phrase: drop the rest
+                keep = int(EARLY_WAKE_HEAD_S / FRAME_S)
+                self.buf = self.buf[-keep:]
+                self.utter_start = time.time() - keep * FRAME_S
+                self.vc_next, self.vc_strikes = time.time() + 1.5, 0
+                self.stall_next = time.time() + STALL_AFTER_S
             owner, sc = self.owner_check(head)
             if owner is False:                        # someone else: not even the pill (checked again at the end)
                 log(f"Early wake spot from someone else ignored (voice match {sc:.2f}).")
@@ -2330,7 +2462,7 @@ class Listener:
     def owner_check(self, audio):
         """-> (True = the owner, False = someone else, None = can't tell / not set up / off, score)."""
         v = self.voiceid
-        self.last_emb, self.last_score = None, 0.0
+        self.last_emb, self.last_score, self.last_owner = None, 0.0, None
         if v is None or not v.enrolled or not settings()["voice_match"]:
             return None, 0.0
         try:
@@ -2342,7 +2474,9 @@ class Listener:
             return None, 0.0                           # too little speech to judge
         s = v.score(emb)
         self.last_emb, self.last_score = emb, s
-        return s >= v.threshold(settings()["voice_match_threshold"]), s
+        ok = s >= v.threshold(settings()["voice_match_threshold"])
+        self.last_owner = ok
+        return ok, s
 
     def start_enrollment(self):
         """'Hey Claude, learn my voice' / the chat's gear menu: 5 phrases -> the owner's voiceprint."""
@@ -3045,6 +3179,10 @@ class Listener:
                 and now - self.last_activity > CONTEXT_WINDOW_S):
             self.end_conversation("15 minutes idle")
         self.show_notice()
+        try:
+            self.update_duck()
+        except Exception as e:
+            log(f"Ducking failed: {e!r}")
 
     def show_notice(self):
         """A heads-up waits for a quiet moment: nothing being said, collected, worked on or spoken."""
@@ -3149,8 +3287,11 @@ class Listener:
                 if audio is None and self.in_speech and self.q.qsize() < 10:   # don't fall behind
                     try:
                         self.check_early_wake()
+                        self.check_voice_continuity()
+                        if self.in_speech:
+                            self.check_stall()
                     except Exception as e:
-                        log(f"Early wake check failed: {e!r}")
+                        log(f"Early wake / end-of-command check failed: {e!r}")
                 if audio is not None:
                     try:
                         self.handle(audio)

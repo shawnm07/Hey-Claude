@@ -72,9 +72,16 @@ F20 or clicks the mic button in the chat (push-to-talk); typing works anytime.
 1. **Hearing:** speech is turned into text on the laptop (Whisper). Nothing is
    recorded or sent anywhere unless it starts with "Hey Claude" (or the user
    pressed F20 / the mic button).
-2. **Collecting the command:** it keeps listening while the user talks; short
-   pauses are fine. The pill shows the words as they come in, with a check
-   button (send now) and an X (cancel). Esc also cancels.
+2. **Collecting the command:** after "Hey Claude" the user has 9 seconds to
+   start, and pauses up to `pause_allowed_seconds` are fine. End of speech is
+   decided by a voice activity detector (Silero VAD), not loudness, so music,
+   TV or a fan count as silence and a command ends when the user's voice
+   stops. While listening it turns the laptop's volume down to 30%
+   (`duck_while_listening`). With voice match, 2 seconds that aren't the
+   user's voice end a command; a command whose last 2 seconds have no words
+   ends there; "Hey Claude" said over ongoing music is still spotted. The pill
+   shows the words as they come in, with a check button (send now) and an X
+   (cancel). Esc also cancels.
 3. **Instant commands** (built in, plus saved skills; see Skills) never reach you: open/close an app, volume, media
    keys, maximize/minimize/restore, the time and the date.
 4. **Choosing a model:** "use Opus / Sonnet / Haiku ..." picks one directly.
@@ -143,7 +150,7 @@ You may change these with the Edit tool, then confirm in one sentence:
   `pause_allowed_seconds` (0.8-4), `listen_after_reply_seconds` (0-10),
   `chat_hud` (true/false; takes effect after a restart), `voice_match`,
   `voice_match_threshold` (0.2-0.8), `heads_up`, `heads_up_check_minutes`
-  (15-720), `heads_up_battery_percent` (5-50).
+  (15-720), `heads_up_battery_percent` (5-50), `duck_while_listening`.
 - **`instructions.md`**: standing instructions about tone and habits.
 - **Memory files** (see Memory).
 - **Skills** in `workspace\skills\` (see Skills): new instant commands, as
