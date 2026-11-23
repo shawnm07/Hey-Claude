@@ -22,9 +22,10 @@ class ChatLog:
             self.dir.mkdir(parents=True, exist_ok=True)
             files = self.files()
             if files:                                  # restarted within the idle window: carry on
-                last = self.read(files[-1], types=("msg", "start"))
+                last = self.read(files[-1], types=("msg", "start", "end"))
                 last_t = max((r.get("t", 0) for r in last), default=0)
-                if any(r.get("type") == "msg" for r in last) and time.time() - last_t < idle_s:
+                ended = any(r.get("type") == "end" for r in last)
+                if not ended and any(r.get("type") == "msg" for r in last) and time.time() - last_t < idle_s:
                     self.path = files[-1]
         except Exception as e:
             self.log(f"Conversation log setup failed: {e!r}")
@@ -76,6 +77,11 @@ class ChatLog:
         """Start a new conversation (the next message creates its file). Returns the old file."""
         with self.lock:
             old, self.path = self.path, None
+            if old is not None:                        # so a restart doesn't pick an ended conversation back up
+                try:
+                    self._write(old, {"type": "end", "t": time.time()})
+                except Exception as e:
+                    self.log(f"Couldn't mark the conversation ended: {e!r}")
         return old
 
     def previous(self, before=None):

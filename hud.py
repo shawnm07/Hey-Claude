@@ -208,7 +208,8 @@ class Hud:
     CODE_FG, CODE_BG = "#f2b880", "#121215"
     LISTEN_BG, LISTEN_EDGE = "#1a2238", "#2f4580"
     COLORS = {"listen": "#5b8cff", "think": "#f5a524", "act": "#a78bfa", "done": "#34d399",
-              "error": "#f87171", "ask": "#5b8cff", "idle": "#d97757"}
+              "error": "#f87171", "ask": "#5b8cff", "idle": "#d97757",
+              "notice": "#f5a524"}
     PULSING = {"listen", "think", "act"}
     ALPHA = 0.97
 
@@ -246,6 +247,10 @@ class Hud:
         except Exception:
             pass
         _u32.ShowWindow(self.hwnd, 0)
+        # Never in any screenshot: not the program's own (screen context, `hey_claude.py --screens`, which runs
+        # as a separate process) and not other capture tools. It stays fully visible on the monitor.
+        if not _u32.SetWindowDisplayAffinity(self.hwnd, 0x11):           # WDA_EXCLUDEFROMCAPTURE
+            self.log(f"HUD: couldn't exclude it from screenshots (error {ctypes.get_last_error()}).")
 
         self.mode = "hidden"                    # hidden | pill | chat
         self.geo, self.alpha, self.anim = (-20000, -20000, 10, 10), 0.0, None
@@ -314,17 +319,8 @@ class Hud:
 
     @contextlib.contextmanager
     def capture_hidden(self):
-        """Keep the HUD out of screenshots taken inside this block (it stays visible on screen)."""
-        if not self.visible:
-            yield
-            return
-        ev = threading.Event()
-        self.q.put(("affinity", 0x11, ev))           # WDA_EXCLUDEFROMCAPTURE
-        ev.wait(0.3); time.sleep(0.05)               # one composition frame
-        try:
-            yield
-        finally:
-            self.q.put(("affinity", 0, None))
+        """Screenshots never include the HUD (it is always excluded from capture, see __init__)."""
+        yield
 
     # ============================================================ building: pill + preview
     def _build_pill(self):
@@ -499,6 +495,7 @@ class Hud:
         m = self.menu = tk.Frame(c, bg=self.PANEL, highlightthickness=1, highlightbackground=self.BORDER,
                                  highlightcolor=self.BORDER)
         for icon, text, fn in ((ICON["add"], "New conversation", lambda: (self._close_menu(), self._act("new"))),
+                               (ICON["mic"], "Set up voice match", lambda: (self._close_menu(), self._act("enroll"))),
                                (ICON["folder"], "Open conversation logs", self._open_logs)):
             row = tk.Frame(m, bg=self.PANEL, cursor="hand2")
             row.pack(fill="x")

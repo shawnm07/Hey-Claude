@@ -18,3 +18,6 @@ workspace/.approval
 triage/
 workspace/skills/
 skills-verified.json
+voiceprint.json
+headsup-state.json
+headsup/

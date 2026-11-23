@@ -27,6 +27,9 @@ Each skill is a folder in workspace/skills/ holding a script (.ps1 or .py) and a
              only after a clear yes (forced on for anything that looks destructive or outward-facing).
   timeout    seconds (default 15, at most 60); the script is stopped after that and counts as failed.
   enabled    false = ignored.
+  undo       optional, for "undo that": {"script": "undo.ps1", "args": ["{undo}"], "reply": "[silent] Undone."}.
+             The main script can print a line "UNDO: <value>" (never shown or spoken), e.g. the previous
+             brightness; {undo} in the undo args is that value, {name} the original parameters.
 
 Safety, enforced here and not just by the instructions:
   * A new or changed skill (manifest or script) is not trusted yet: its first run goes through the
@@ -59,7 +62,8 @@ BLOCK_RE = re.compile(
 APPROVAL_RE = re.compile(
     r"(?:\b(?:remove-item|rm|del|erase|rmdir|rd|ri|clear-content|clear-recyclebin|set-content|out-file|"
     r"move-item|rename-item|copy-item|stop-process|kill|taskkill|spps|stop-computer|restart-computer|"
-    r"shutdown|logoff|format-volume|format|diskpart|send-mailmessage|send-compose|reg(?:\.exe)?\s+(?:add|delete|import)|"
+    r"shutdown(?!(?:\.exe)?\s+[/-]h\b)|logoff|format-volume|format\.com|diskpart|send-mailmessage|send-compose|"
+    r"reg(?:\.exe)?\s+(?:add|delete|import)|"
     r"set-itemproperty|new-itemproperty|remove-itemproperty|set-service|stop-service|restart-service|"
     r"disable-\w+|enable-\w+|netsh|set-net\w+|remove-\w+|uninstall-\w+|unregister-\w+|"
     r"os\.remove|os\.unlink|os\.rmdir|shutil\.rmtree|shutil\.move|subprocess|os\.system|os\.popen)\b"
@@ -113,6 +117,7 @@ class Skill:
         self.triggers, self.params, self.args, self.reply = [], {}, [], "{output}"
         self.approval, self.timeout, self.script, self.description = False, DEFAULT_TIMEOUT_S, None, ""
         self.digest = ""
+        self.undo_script, self.undo_args, self.undo_reply, self.undo_approval = None, [], "[silent] Undone.", False
         try:
             raw = (folder / "skill.json").read_bytes()
             m = json.loads(raw.decode("utf-8-sig"))
@@ -130,7 +135,20 @@ class Skill:
                 return
             self.script = script
             code = script.read_bytes()
-            self.digest = hashlib.sha256(raw + b"\0" + code).hexdigest()
+            undo_code = b""
+            u = m.get("undo")
+            if isinstance(u, dict) and u.get("script"):
+                us = (folder / str(u["script"])).resolve()
+                if folder.resolve() in us.parents and us.suffix.lower() in (".ps1", ".py") and us.exists():
+                    self.undo_script, undo_code = us, us.read_bytes()
+                    self.undo_args = [str(a) for a in (u.get("args") or [])]
+                    self.undo_reply = str(u.get("reply") or "[silent] Undone.")
+                    utext = undo_code.decode("utf-8", errors="replace")
+                    if BLOCK_RE.search(utext):
+                        self.undo_script = None
+                    elif APPROVAL_RE.search(utext):
+                        self.undo_approval = True
+            self.digest = hashlib.sha256(raw + b"\0" + code + b"\0" + undo_code).hexdigest()
             text = code.decode("utf-8", errors="replace")
             self.params = {k: (v if isinstance(v, dict) else {"type": str(v)}) for k, v in (m.get("params") or {}).items()}
             self.args = [str(a) for a in (m.get("args") or [])]
@@ -190,12 +208,13 @@ class Skill:
                 return values
         return None
 
-    def argv(self, values, python_exe):
-        args = [_fill(a, values) for a in self.args]
-        if self.script.suffix.lower() == ".py":
-            return [str(python_exe), "-I", str(self.script), *args]
+    def argv(self, values, python_exe, script=None, args=None):
+        script = script or self.script
+        args = [_fill(a, values) for a in (self.args if args is None else args)]
+        if script.suffix.lower() == ".py":
+            return [str(python_exe), "-I", str(script), *args]
         return ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                "-File", str(self.script), *args]
+                "-File", str(script), *args]
 
     def command_line(self, values, python_exe):
         """The same command, for the model to run with its PowerShell tool."""
@@ -210,6 +229,7 @@ class SkillBook:
         self.dir, self.verified_file, self.python, self.log = Path(folder), Path(verified_file), python_exe, log
         self.lock = threading.Lock()
         self.skills, self.sig, self.reported = [], None, set()
+        self.last_undo = None
         try:
             self.verified = json.loads(self.verified_file.read_text(encoding="utf-8"))
         except Exception:
@@ -272,24 +292,42 @@ class SkillBook:
                 self.log(f"Couldn't save verified skills: {e!r}")
         self.log(f"Skill '{s.name}' verified; it now runs instantly.")
 
-    def run(self, s: Skill, values):
-        """Run the script. -> (ok, reply text or error description)."""
+    def _exec(self, s: Skill, values, script, args, reply_template):
         t = time.time()
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
-        enc = "utf-8" if s.script.suffix.lower() == ".py" else "oem"
+        enc = "utf-8" if script.suffix.lower() == ".py" else "oem"
         try:
-            r = subprocess.run(s.argv(values, self.python), cwd=s.folder, capture_output=True, timeout=s.timeout,
-                               env=env, creationflags=NO_WINDOW)
+            r = subprocess.run(s.argv(values, self.python, script, args), cwd=s.folder, capture_output=True,
+                               timeout=s.timeout, env=env, creationflags=NO_WINDOW)
         except subprocess.TimeoutExpired:
-            return False, f"it took longer than its {s.timeout:g} s timeout and was stopped"
+            return False, f"it took longer than its {s.timeout:g} s timeout and was stopped", None
         except Exception as e:
-            return False, f"it couldn't start ({e!r})"
+            return False, f"it couldn't start ({e!r})", None
         out = r.stdout.decode(enc, errors="replace").strip()
         err = r.stderr.decode(enc, errors="replace").strip()
-        self.log(f"  skill '{s.name}' exit {r.returncode} in {time.time() - t:.2f}s; output {out[-200:]!r}"
-                 + (f"; errors {err[-300:]!r}" if err else ""))
+        undo = None
+        lines = []
+        for ln in out.splitlines():                    # "UNDO: <value>" lines are for "undo that", not shown
+            mm = re.match(r"^\s*UNDO:\s*(.*)$", ln)
+            if mm:
+                undo = mm.group(1).strip()[:200]
+            else:
+                lines.append(ln)
+        out = "\n".join(lines).strip()
+        self.log(f"  skill '{s.name}'{' undo' if script != s.script else ''} exit {r.returncode} in "
+                 f"{time.time() - t:.2f}s; output {out[-200:]!r}" + (f"; errors {err[-300:]!r}" if err else ""))
         if r.returncode != 0:
-            return False, f"exit code {r.returncode}: {(err or out)[-600:] or 'no output'}"
-        values = dict(values, output=out[-800:])
-        reply = _fill(s.reply, values).strip()
-        return True, reply or "Done."
+            return False, f"exit code {r.returncode}: {(err or out)[-600:] or 'no output'}", None
+        reply = _fill(reply_template, dict(values, output=out[-800:])).strip()
+        return True, reply or "Done.", undo
+
+    def run(self, s: Skill, values):
+        """Run the script. -> (ok, reply text or error description). self.last_undo = its UNDO value."""
+        ok, reply, self.last_undo = self._exec(s, values, s.script, None, s.reply)
+        return ok, reply
+
+    def run_undo(self, s: Skill, values, undo_value):
+        """Reverse an earlier run with the skill's undo script."""
+        vals = dict(values, undo="" if undo_value is None else undo_value)
+        ok, reply, _ = self._exec(s, vals, s.undo_script, s.undo_args, s.undo_reply)
+        return ok, reply

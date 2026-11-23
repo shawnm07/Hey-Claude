@@ -33,7 +33,7 @@ conversation, or hold **F20** to talk.
   go to Sonnet. Research, writing and planning go to Opus. Say "use Opus…" to choose. Each model is a
   long-running `claude -p` session, so there's no start-up delay.
 - **Sees your screen when you mean it.** "this", "that page", "here" attach a screenshot of every monitor,
-  taken the moment you spoke. The HUD itself is excluded from them.
+  taken the moment you spoke. The HUD is never in them.
 - **Talks back.** [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) TTS, sentence by sentence. It never
   clips the first word on Bluetooth speakers (see *How it works*). Say "Hey Claude" over it to interrupt.
 - **Conversations.** Commands share context across models until 15 quiet minutes pass, or you press **New
@@ -101,6 +101,48 @@ Skills can't get around the safety rules:
 - If a skill fails, the request falls back to the normal model, along with the error, so it can do the job (and
   fix the script).
 
+### Follow-ups while it's working
+
+While Claude is still working on something, just keep going. Say *"Hey Claude, also…"* or type in the chat, and
+your follow-up is added to the **running task**: Claude Code folds a message that arrives mid-task into the same
+turn, so you get one answer that covers both. Instant commands and skills still run immediately in the meantime, and
+*"stop"* or *"cancel"* ends the task. (Model calls run on a worker thread, so the mic and the chat never block.)
+
+### Voice match
+
+Say *"Hey Claude, learn my voice"* (or use the chat's gear menu) and read 5 short phrases. From then on it only
+wakes for **your** voice. Roommates saying "Hey Claude", or talking in the middle of your command, are ignored silently.
+It uses a [WeSpeaker](https://github.com/wenet-e2e/wespeaker) ResNet34 speaker-embedding model, running locally with
+onnxruntime (~35 ms per check). Only a voiceprint is stored (256 numbers in `voiceprint.json`), never audio. It keeps
+itself current from commands that matched confidently. With too little speech to judge, it falls back to the old
+loudness/pitch check instead of dropping you, and F20 and the chat always work. *"Forget my voice"* turns it off.
+
+### Heads-ups
+
+On its own, the pill (never the voice) shows a heads-up for:
+- **low battery**, at 20% and again at 10%
+- **calendar events**, 10 minutes before they start
+- **timed tasks**, an hour before they're due
+- **all-day tasks due today**, in the morning, and those **due tomorrow**, in the evening
+
+Low battery is checked locally. Calendar and TickTick are read once an hour by a small, read-only Sonnet session
+(no built-in tools, JSON answers only), and only while the screen is on. Heads-ups wait for a quiet moment, then stay
+until you move the mouse or type. They're configurable in `settings.json`: `heads_up`, `heads_up_check_minutes`,
+`heads_up_battery_percent`.
+
+### Undo
+
+*"Undo that"* reverses the last action. Volume, media keys, window size and opening/closing apps are reversed
+instantly. So are skills that ship an undo: their script prints `UNDO: <value>`, which is handed to the skill's undo
+script. Anything Claude did goes back to Claude with a note on what to reverse. The approval rules don't change: if
+undoing means deleting, closing something with unsaved work or sending, it asks first. Sent messages can't be unsent.
+
+### Session memory
+
+When a conversation ends, the same review that updates learned memory also adds a line to
+`workspace/memory/sessions.md`: what you were working on and what's still unfinished. That file is loaded into every
+new conversation, so *"what was I working on?"* or *"where did we leave off?"* just works, even days later.
+
 ### On battery
 
 The always-on wake word only runs while plugged in or docked, to save power. Everything else still works on
@@ -135,6 +177,10 @@ py -3.11 -m venv .venv
 **Voice:** download `kokoro-v1.0.int8.onnx` and `voices-v1.0.bin` from the
 [kokoro-onnx releases](https://github.com/thewh1teagle/kokoro-onnx/releases) (model files v1.0) into `voice\`.
 
+**Voice match (optional):** download `voxceleb_resnet34_LM.onnx` (26.5 MB) from
+[Wespeaker/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM) into
+`voice\speaker\`. Without it, everything else works and voice match is simply unavailable.
+
 **Try it:**
 
 ```powershell
@@ -158,7 +204,7 @@ On first run Hey Claude creates its private workspace files, which are git-ignor
 |---|---|
 | `workspace/CLAUDE.md` | Instructions for the assistant, created from `CLAUDE.example.md`. Add your task app, lists, school or work context, and helper scripts here. |
 | `workspace/instructions.md` | Tone and habits ("be more concise"). It can change this itself when you ask. |
-| `workspace/memory/` | `permanent.md` (what you told it to remember), `learned.md` (its own notes), `about-user.md` (your profile) |
+| `workspace/memory/` | `permanent.md` (what you told it to remember), `learned.md` (its own notes), `about-user.md` (your profile), `sessions.md` (what you've been working on) |
 | `workspace/settings.json` | Models per tier, effort, voice, timings, `chat_hud`. It can edit this by voice ("use Sonnet for simple stuff"). |
 | `workspace/conversations/` | One JSON-lines log per conversation, append-only |
 | `workspace/skills/` | Your script skills (starts with the samples) |
@@ -192,8 +238,9 @@ A few details that took some figuring out:
 - **The HUD never steals focus** (`WS_EX_NOACTIVATE`) until you open the chat. Closing the chat gives focus
   back to the window you were in. F20 uses `RegisterHotKey` plus key-state polling for hold detection, not a
   global keyboard hook, so typing elsewhere is never slowed down.
-- **Screenshots exclude the HUD** with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, only for the
-  moment the screenshot is taken.
+- **Screenshots never include the HUD.** The pill and chat window are permanently excluded from screen capture
+  with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`. That covers the screen context sent with a command, the
+  separate `--screens` process the model runs, and other capture tools. They stay fully visible on your monitor.
 
 ### Files
 
@@ -202,7 +249,9 @@ A few details that took some figuring out:
 | `hey_claude.py` | Listener, wake word, routing, Claude sessions, voice, local actions |
 | `hud.py` | The status pill and chat window (Tkinter, canvas-rendered, light markdown) |
 | `chatlog.py` | Append-only conversation logs |
-| `skills.py` | Script skills: manifests, trigger matching, safety scan, runner |
+| `skills.py` | Script skills: manifests, trigger matching, safety scan, runner, undo |
+| `voiceid.py` | Voice match: Kaldi-style filterbank + WeSpeaker embeddings, enrollment, adaptation |
+| `headsup.py` | Proactive heads-ups: battery, calendar events, due tasks |
 | `skills-examples/` | Sample skills, copied to `workspace/skills/` on first run |
 | `approval_gate.py` | Claude Code `PreToolUse` hook that enforces the email-send approval lock |
 | `tools/` | Gmail compose / send helpers (browser only; no email API access) |

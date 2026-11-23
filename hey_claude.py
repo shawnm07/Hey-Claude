@@ -56,6 +56,8 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
+from skills import normalize as normalize_cmd
+
 # ================================================================= settings
 
 HERE = Path(__file__).resolve().parent
@@ -120,11 +122,19 @@ DEFAULT_SETTINGS = {
     "pause_allowed_seconds": 1.4,
     "listen_after_reply_seconds": 3,
     "chat_hud": True,              # false = the old status pill only (no chat window); read at startup
+    "voice_match": True,           # once set up ("learn my voice"): only wake for the owner's voice
+    "voice_match_threshold": 0.4,  # 0.2-0.8: higher = stricter (lowered automatically for a varied voice)
+    "heads_up": True,              # pill-only heads-ups: events, due tasks, low battery
+    "heads_up_check_minutes": 60,  # how often TickTick / Calendar are checked (a Sonnet call each time)
+    "heads_up_battery_percent": 20,
 }
 CONV_DIR = WORKSPACE / "conversations"   # one .jsonl log per conversation (append-only, never deleted)
 SKILLS_DIR = WORKSPACE / "skills"        # script skills: instant commands the models can create (skills.py)
 SKILLS_VERIFIED = HERE / "skills-verified.json"   # skills whose first run went through a model (kept out of
 SKILL_EXAMPLES = HERE / "skills-examples"         # the workspace, so a model can't mark its own skill trusted)
+SPEAKER_MODEL = HERE / "voice" / "speaker" / "voxceleb_resnet34_LM.onnx"   # WeSpeaker voice embeddings
+VOICEPRINT = HERE / "voiceprint.json"            # the owner's voice profile: numbers only, never audio
+HEADSUP_STATE = HERE / "headsup-state.json"      # which heads-ups were already shown
 
 
 class Settings:
@@ -170,8 +180,11 @@ class Settings:
         num("voice_speed", 0.7, 1.6); num("hud_seconds_after_reply", 3, 120)
         num("answer_window_seconds", 3, 30); num("pause_allowed_seconds", 0.8, 4.0)
         num("listen_after_reply_seconds", 0, 10)
-        if isinstance(raw.get("chat_hud"), bool):
-            d["chat_hud"] = raw["chat_hud"]
+        for key in ("chat_hud", "voice_match", "heads_up"):
+            if isinstance(raw.get(key), bool):
+                d[key] = raw[key]
+        num("voice_match_threshold", 0.2, 0.8); num("heads_up_check_minutes", 15, 720)
+        num("heads_up_battery_percent", 5, 50)
         old, self.data = self.data, d
         if old != d:
             log(f"Settings loaded: {json.dumps(d)}")
@@ -238,8 +251,26 @@ REFLECT_PROMPT = (
     "under 40 short bullets, and remove anything outdated or contradicted. Skip things already in "
     "memory/permanent.md or memory/about-user.md, one-off details, passwords, and private content from "
     "screenshots. Only add what isn't already noted in your memory files; if nothing new was learned, change "
-    "nothing. Never edit memory/permanent.md or memory/about-user.md. Reply with just 'updated' or 'no change'."
+    "nothing. Never edit memory/permanent.md or memory/about-user.md. "
+    "Then update memory/sessions.md, the log of what the user has been working on (newest first): add or update "
+    "ONE bullet for this conversation, labeled “{conv}”: what they worked on, and anything left unfinished, "
+    "promised for later or waiting on them. Skip it if the conversation was only quick commands (time, volume, "
+    "opening apps). Mark earlier bullets done when this conversation finished them; keep at most 12 bullets "
+    "(drop the oldest). Reply with just 'updated' or 'no change'."
 )
+
+
+def reflect_prompt(conv_label: str) -> str:
+    return REFLECT_PROMPT.replace("{conv}", conv_label)
+
+
+def conv_label(path=None) -> str:
+    """'Mon Nov 23, 2:35 PM' for a conversation file (or now)."""
+    try:
+        t = time.strptime(Path(path).stem[:19], "%Y-%m-%d_%H-%M-%S") if path else time.localtime()
+    except Exception:
+        t = time.localtime()
+    return time.strftime("%a %b %d, %I:%M %p", t).replace(" 0", " ")
 # Hey Claude was stopped (restart, sign-out, crash) before an earlier conversation's sessions could review it
 CATCHUP_HEAD = (
     "[Automatic wrap-up, not from the user.] Hey Claude was restarted before it could review an earlier "
@@ -261,6 +292,23 @@ SPEAK_REQ_RE = re.compile(
     r"read (?:it|this|that) (?:to|for) me|tell me verbally|use your voice|(?:with|in) your voice|"
     r"(?:voice|spoken) (?:reply|answer|response)|let me hear|i want to hear)\b", re.I)
 SPEAK_TAG_RE = re.compile(r"[ \t]*\[speak\][ \t]*", re.I)
+# "undo that": reverse the last action (instant actions here, model actions via the model, approval rules as usual)
+UNDO_RE = re.compile(r"(?:undo|reverse|revert|take back|put (?:it|that|everything) back)(?: (?:that|this|it|the last "
+                     r"(?:thing|action|one|change|command)|what you (?:just )?did|your last (?:action|change)))?", re.I)
+# said / typed while a model is working: stop that task
+STOP_TASK_RE = re.compile(r"(?:stop|cancel|never ?mind|forget it|stop (?:that|it|working|what you'?re doing)|"
+                          r"cancel (?:that|it|the (?:task|request)))", re.I)
+# voice match setup / reset
+ENROLL_RE = re.compile(r"(?:learn|enroll|train on|set up|setup|teach (?:you|it)|register) (?:my voice|voice (?:match|"
+                       r"matching|id|recognition))(?: again)?|voice (?:match )?set ?up", re.I)
+ENROLL_PHRASES = [
+    "Hey Claude, what's the weather like tomorrow?",
+    "Hey Claude, open Spotify and play something relaxing.",
+    "Hey Claude, add a reminder to call home tonight at eight.",
+    "Hey Claude, what's on my calendar this week?",
+    "The quick brown fox jumps over the lazy dog, then naps in the sun.",
+]
+FORGET_VOICE_RE = re.compile(r"forget my voice|(?:delete|reset|clear|erase) (?:my )?voice ?(?:print|profile|match)", re.I)
 STOPPED = "\x00stopped"          # ClaudeSession.ask() result when the user pressed Stop
 
 # ---- model routing (first match wins; instant local actions are tried before this)
@@ -786,7 +834,7 @@ class Overlay:
     Other threads call show()/hide()/hide_after(); only the Tk thread touches widgets."""
     BG, FG, SUB = "#18181b", "#fafafa", "#a1a1aa"
     COLORS = {"listen": "#5b8cff", "think": "#f5a524", "act": "#a78bfa", "done": "#34d399",
-              "error": "#f87171", "ask": "#5b8cff"}
+              "error": "#f87171", "ask": "#5b8cff", "notice": "#f5a524"}
     PULSING = {"listen", "think", "act"}
 
     def __init__(self):
@@ -829,6 +877,10 @@ class Overlay:
         except Exception:
             pass
         user32.ShowWindow(self.hwnd, 0)
+        try:                                                                 # never in screenshots
+            user32.SetWindowDisplayAffinity(wt.HWND(self.hwnd), 0x11)       # WDA_EXCLUDEFROMCAPTURE
+        except Exception:
+            pass
         self.q: "queue.Queue" = queue.Queue()
         self.state, self.visible, self.hide_at, self.phase = None, False, None, 0
         self.lingering, self.linger_start = False, 0.0
@@ -1186,6 +1238,8 @@ class ClaudeSession:
         self.model, self.p, self.lines, self.turns = model, None, None, 0
         self.seen, self.fresh = 0, True
         self.effort = settings()["effort"][model]
+        self.wlock = threading.Lock()                  # stdin writes: ask() vs. follow-ups from the main loop
+        self.working, self.injected = False, 0         # a request is running / follow-ups added to it
 
     def args(self):
         a = [str(CLAUDE), "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
@@ -1229,31 +1283,71 @@ class ClaudeSession:
                 pass
         self.p = None
 
+    def _send(self, text):
+        self.p.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n")
+        self.p.stdin.flush()
+
+    def inject(self, text) -> bool:
+        """Add a follow-up to the request that's running right now. Claude Code folds a message that
+        arrives mid-task into the same turn (tested: one result that honors both). False if nothing is
+        running anymore (the caller then runs it as a new command)."""
+        with self.wlock:
+            if not self.working or not self.alive():
+                return False
+            try:
+                self._send(text)
+            except OSError:
+                return False
+            self.injected += 1
+            return True
+
+    def _finish(self):
+        with self.wlock:
+            self.working = False
+
     def ask(self, text: str, progress=lambda d: None, stop=None) -> str:
         """stop: a threading.Event; when set (Stop in the chat), the request is abandoned and this
-        session restarts fresh (it then gets the conversation so far as context). Returns STOPPED."""
+        session restarts fresh (it then gets the conversation so far as context). Returns STOPPED.
+        Follow-ups added with inject() while this runs are part of the same request."""
         if not self.alive():
             self.start()
+        while True:                                    # leftovers from an earlier request (never expected)
+            try:
+                if self.lines.get_nowait() is None:
+                    self.start()
+                    break
+            except queue.Empty:
+                break
         self.turns += 1
         try:
-            self.p.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n")
-            self.p.stdin.flush()
+            with self.wlock:
+                self._send(text)
+                self.working, self.injected = True, 0
         except OSError:
             self.start(); return self.ask(text, progress, stop)
         deadline = time.time() + CLAUDE_TIMEOUT_S
+        replies, seen, settle_until = [], 0, 0.0
         while True:
             if stop is not None and stop.is_set():
-                log("  stopped by the user"); self.start()
+                log("  stopped by the user"); self._finish(); self.start()
                 return STOPPED
             try:
                 line = self.lines.get(timeout=max(0.05, min(0.25, deadline - time.time())))
             except queue.Empty:
+                if replies:
+                    # A follow-up arrived during this request. Usually it was folded into the same turn;
+                    # if it came in too late, Claude Code starts one more turn right away: wait for it.
+                    with self.wlock:
+                        if self.injected == seen and time.time() >= settle_until:
+                            self.working = False
+                            return "\n\n".join(r for r in replies if r)
+                    continue
                 if time.time() < deadline:
                     continue
-                log("  timed out"); self.start()
+                log("  timed out"); self._finish(); self.start()
                 return "Sorry, that took too long."
             if line is None:
-                log("  Claude session ended unexpectedly"); self.p = None
+                log("  Claude session ended unexpectedly"); self._finish(); self.p = None
                 return "Sorry, something went wrong."
             try:
                 ev = json.loads(line)
@@ -1267,10 +1361,18 @@ class ClaudeSession:
                 reply = (ev.get("result") or "").strip()
                 if ev.get("is_error"):
                     log(f"  error: {reply}")
+                    self._finish()
                     if "log in" in reply.lower() or "/login" in reply.lower():
                         return "Claude Code isn't signed in."
                     return "Sorry, that didn't work."
-                return reply
+                replies.append(reply)
+                with self.wlock:
+                    if self.injected == 0:
+                        self.working = False
+                        return reply
+                    seen = self.injected
+                settle_until = time.time() + 2.5
+                deadline = time.time() + CLAUDE_TIMEOUT_S
 
 
 def parse_reply(reply: str):
@@ -1308,7 +1410,7 @@ def parse_reply(reply: str):
 
 def chat_text(reply: str) -> str:
     """The reply as shown in the chat window: display markers removed, formatting kept."""
-    r = re.sub(r"[ \t]*\[(?:silent|keep|ignore|speak)\][ \t]*", " ", reply or "", flags=re.I)
+    r = re.sub(r"[ \t]*\[(?:silent|keep|ignore|speak|escalate)\][ \t]*", " ", reply or "", flags=re.I)
     r = re.sub(r"[ \t]*\[screen\][ \t]*", "\n\n", r, flags=re.I)
     return re.sub(r"[ \t]{2,}", " ", r).strip()
 
@@ -1367,6 +1469,46 @@ class TriageSession(ClaudeSession):
         return verdict
 
 
+HEADSUP_DIR = HERE / "headsup"
+
+
+class HeadsUpSession(ClaudeSession):
+    """Read-only Sonnet session for heads-ups: no built-in tools, only the TickTick / Calendar
+    connectors (the blocked ones stay blocked), its own folder, a JSON-only system prompt."""
+
+    def __init__(self):
+        m = settings()["models"]["normal"]
+        super().__init__("sonnet" if m == "haiku" else m)   # Haiku has no connectors
+
+    def args(self):
+        from headsup import AGENDA_PROMPT
+        return [str(CLAUDE), "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                "--model", self.model, "--effort", "low", "--tools", "", "--no-session-persistence",
+                "--permission-mode", "auto", "--permission-prompts", "none", "--system-prompt", AGENDA_PROMPT,
+                "--disallowedTools", *BLOCKED_CONNECTORS]
+
+    def start(self):
+        HEADSUP_DIR.mkdir(exist_ok=True)
+        self.stop()
+        self.effort = "low"
+        self.p = subprocess.Popen(self.args(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, cwd=HEADSUP_DIR, text=True, encoding="utf-8",
+                                  errors="replace", bufsize=1, creationflags=NO_WINDOW)
+        self.lines, self.turns, self.seen, self.fresh = queue.Queue(), 0, 0, True
+        threading.Thread(target=self._read, args=(self.p, self.lines), daemon=True).start()
+        return self
+
+
+def power_info():
+    """-> (on AC, battery percent or None, seconds left or None, has a battery)."""
+    s = _PowerStatus()
+    kernel32.GetSystemPowerStatus(ctypes.byref(s))
+    has = s.BatteryFlag != 255 and not (s.BatteryFlag & 128)
+    pct = None if s.BatteryLifePercent == 255 else int(s.BatteryLifePercent)
+    secs = None if s.BatteryLifeTime in (0xFFFFFFFF, 0) else int(s.BatteryLifeTime)
+    return s.ACLineStatus == 1, pct, secs, has
+
+
 def describe_tool(b) -> str:
     name, inp = b.get("name", ""), b.get("input", {}) or {}
     if name in ("PowerShell", "Bash"):
@@ -1392,6 +1534,39 @@ CONNECTOR_RE = re.compile(
     re.I)
 CANT_RE = re.compile(r"\b(?:can't|cannot|can not|unable to|don't have|do not have|no)\b[^.]{0,40}?"
                      r"\b(?:reach|access|connect|connector|tools?|permission)\b", re.I)
+# Things the user asks that need the task / calendar connectors (Sonnet up front, never Haiku)
+AGENDA_RE = re.compile(
+    r"\b(?:agenda|planner|plans?|to-?dos?|tasks?|deadlines?|due|upcoming|schedule|calendar|busy|free time)\b"
+    r"|\bwhat (?:should|do|can) i (?:do|work on|focus on|start|tackle)\b|\bwhat(?:'s| is| do i have)? (?:due|next|up|left|on)\b"
+    r"|\bwhat do i have\b|\bmy (?:day|week|weekend|morning|afternoon|evening)\b"
+    r"|\b(?:today|tonight|tomorrow|this (?:week|weekend|morning|afternoon|evening)|next week|monday|tuesday|"
+    r"wednesday|thursday|friday|saturday|sunday)\b.{0,25}\b(?:do|have|plan|due|free|busy|work|class|classes)\b"
+    r"|\b(?:do|have|plan|due|free|busy)\b.{0,25}\b(?:today|tonight|tomorrow|this week(?:end)?|next week|monday|"
+    r"tuesday|wednesday|thursday|friday|saturday|sunday)\b|\bam i (?:free|busy|doing anything)\b", re.I)
+# A model that can't do the job: an explicit [escalate] marker, or tell-tale phrasings -> next model up, silently
+ESCALATE_RE = re.compile(r"\[escalate\]", re.I)
+ESCALATE_MORE_RE = re.compile(
+    r"\b(?:can't|cannot|can not|unable to|not able to|don't|do not)\s+(?:see|check|read|look up|open|view|get to|"
+    r"pull up|access|reach)\b|\bfrom (?:this|my) (?:model|session|version)\b|\bthis model\b|\bask (?:me |it )?again\b"
+    r"|\btry again\b|\b(?:go|goes|route[sd]?|send|sent|pass(?:ed)?|hand(?:ed)? (?:it )?off|switch(?:ing)?)\s+"
+    r"(?:it |this |that |you )?(?:over )?to (?:sonnet|opus|a (?:bigger|stronger|different|more capable) model)\b"
+    r"|\b(?:sonnet|opus) (?:can|could|would|will)\b|\b(?:isn't|is not|aren't|are not|not) available (?:to|on|in|for) "
+    r"(?:me|this|haiku)\b|\bno access to\b|\bdon't have (?:access|the tools|that tool|a way)\b", re.I)
+NEXT_MODEL = {"haiku": "sonnet", "sonnet": "opus"}
+
+
+def escalation_reason(reply: str, model: str):
+    """Why this reply should be re-run on the next model up (None = it's a real answer)."""
+    if model not in NEXT_MODEL or not reply or reply == STOPPED:
+        return None
+    if ESCALATE_RE.search(reply):
+        return "it replied [escalate]"
+    if model == "haiku" and (CANT_RE.search(reply) or ESCALATE_MORE_RE.search(reply)):
+        return "it said it can't"
+    if re.search(r"\bask (?:me |it )?again\b|\b(?:go|goes|route[sd]?|send|switch\w*)\s+(?:it |this )?to (?:opus|a "
+                 r"(?:bigger|stronger|more capable) model)\b|\bfrom this model\b", reply, re.I):
+        return "it asked to be re-run"
+    return None
 OVERRIDE_RE = re.compile(r"\b(?:use|using|with|ask|have|via)\s+(?:claude\s+)?(opus|sonnet|haiku)\b", re.I)
 
 
@@ -1406,11 +1581,12 @@ def route(command: str):
         model = settings()["models"]["normal" if visual else "simple"]
     elif OPUS_RE.search(command) or words > 30:
         model = settings()["models"]["complex"]
-    elif visual or SONNET_RE.search(command) or CONNECTOR_RE.search(command) or words > 14:
+    elif (visual or SONNET_RE.search(command) or CONNECTOR_RE.search(command) or AGENDA_RE.search(command)
+          or words > 14):
         model = settings()["models"]["normal"]
     else:
         model, visual = settings()["models"]["simple"], False
-    if model == "haiku" and CONNECTOR_RE.search(command):
+    if model == "haiku" and (CONNECTOR_RE.search(command) or AGENDA_RE.search(command)):
         model = "sonnet"                              # the Haiku session has no TickTick/Calendar connectors
     return model, visual
 
@@ -1432,6 +1608,7 @@ class LocalActions:
     def __init__(self):
         self.apps = {}                                # Start menu name (lower) -> (name, AppID)
         self.last_opened = None                       # (display name, time) for "close it"
+        self.last_undo = None                         # how to reverse the action try_handle just did
         threading.Thread(target=self.load_apps, daemon=True).start()
 
     def load_apps(self):
@@ -1478,6 +1655,7 @@ class LocalActions:
         """Return a reply if handled instantly here, else None (send to Claude)."""
         c = re.sub(r"[.!?,]+$", "", command.lower().strip())
         c = re.sub(r"^(please |can you |could you )", "", c)
+        self.last_undo = None                         # set below by actions that can be reversed
 
         if re.fullmatch(r"(what'?s the time|what time is it( now)?|what is the time|time)", c):
             return time.strftime("It's %I:%M %p.").replace(" 0", " ")
@@ -1489,6 +1667,10 @@ class LocalActions:
                          r"([a-z0-9 \-]+?)\s*(?:%|percent)?", c)
         if m and parse_percent(m.group(1)) is not None:   # "set volume to 25", "volume 40 percent"
             level = max(0, min(100, parse_percent(m.group(1))))
+            try:
+                self.last_undo = ("volume", get_volume())
+            except Exception:
+                pass
             set_volume(level)                          # exact level, one step, no model call
             return f"[silent] Volume {level}%."
         m = re.fullmatch(r"(?:turn (?:the )?(?:volume|it|sound|music) (up|down)|volume (up|down)|turn (up|down) the (?:volume|sound|music))( a lot| a little)?", c)
@@ -1496,13 +1678,17 @@ class LocalActions:
             up = "up" in (m.group(1), m.group(2), m.group(3))
             n = 10 if m.group(4) == " a lot" else 2 if m.group(4) == " a little" else 5
             tap_key(0xAF if up else 0xAE, n)
+            self.last_undo = ("keys", 0xAE if up else 0xAF, n, "Volume back.")
             return "[silent] Volume up." if up else "[silent] Volume down."
         if re.fullmatch(r"(pause|play|resume|stop)( the)?( music| song| spotify)?|play music", c):
-            tap_key(0xB3); return "[silent] Play / pause."
+            tap_key(0xB3); self.last_undo = ("keys", 0xB3, 1, "Play / pause.")
+            return "[silent] Play / pause."
         if re.fullmatch(r"(next|skip)( song| track| this song)?|skip( this)?", c):
-            tap_key(0xB0); return "[silent] Next track."
+            tap_key(0xB0); self.last_undo = ("keys", 0xB1, 2, "Back to the previous track.")
+            return "[silent] Next track."
         if re.fullmatch(r"(previous|last|go back)( song| track)?", c):
-            tap_key(0xB1); tap_key(0xB1); return "[silent] Previous track."
+            tap_key(0xB1); tap_key(0xB1); self.last_undo = ("keys", 0xB0, 1, "Next track.")
+            return "[silent] Previous track."
         m = re.fullmatch(r"(maximi[sz]e|minimi[sz]e|restore|un-?maximi[sz]e|make (?:this|it) (?:full ?screen|bigger|smaller))"
                          r"(?: (?:this|it|that|the|my|current))?(?: (?:window|app|one))?", c)
         if m:                                         # acts on the window you're in (the pill never takes focus)
@@ -1510,6 +1696,8 @@ class LocalActions:
             hwnd = user32.GetForegroundWindow()
             if not hwnd:
                 return None
+            before = 3 if user32.IsZoomed(hwnd) else 6 if user32.IsIconic(hwnd) else 9
+            self.last_undo = ("window", hwnd, before)
             if word.startswith("maxim") or "full" in word or "bigger" in word:
                 user32.ShowWindow(hwnd, 3); return "[silent] Maximized."
             if word.startswith("minim") or "smaller" in word:
@@ -1523,6 +1711,7 @@ class LocalActions:
                 allow_foreground()
                 os.startfile(f"shell:AppsFolder\\{app[1]}")
                 self.last_opened = (app[0], time.time())
+                self.last_undo = ("opened", app[0])
                 return f"[silent] Opening {app[0]}."
             return None
         m = re.fullmatch(r"(?:close|quit|exit|kill) (?:the )?(.+?)(?: app)?", c)
@@ -1538,6 +1727,8 @@ class LocalActions:
             r = subprocess.run(["taskkill", "/IM", f"{APP_ALIASES[key]}.exe"], capture_output=True,
                                creationflags=NO_WINDOW)
             label = name if name[:1].isupper() else name.title()
+            if r.returncode == 0:
+                self.last_undo = ("closed", name)
             return f"[silent] Closed {label}." if r.returncode == 0 else f"{label} isn't open."
         return None
 
@@ -1560,8 +1751,22 @@ class Listener:
         # again after a restart, so the context survives it.
         self.chatlog = chatlog or ChatLog(CONV_DIR, CONTEXT_WINDOW_S, log)
         self.history: list = self.history_from_log()  # t, handler, command, reply, source
-        self.last_activity = self.history[-1]["t"] if self.history else 0.0
+        # idle time counts from the latest message of any kind (an unanswered command counts too)
+        self.last_activity = max((m.get("t", 0) for m in self.chatlog.messages()), default=0.0)
         self.stop_event = threading.Event()           # Stop pressed in the chat
+        self.busy = None                               # the model task running on the worker thread (ctx)
+        self.results: "queue.Queue" = queue.Queue()    # (ctx, reply) from the worker
+        self.deferred, self.deferred_new = [], False   # commands / "new conversation" waiting for the task
+        self.undo_stack: list = []                     # recent actions and how to reverse them
+        self.notices: "queue.Queue" = queue.Queue()    # heads-ups waiting for a quiet moment
+        self.enroll = None                             # voice-match setup in progress
+        self.voiceid = None
+        try:
+            from voiceid import VoiceID
+            if SPEAKER_MODEL.exists():
+                self.voiceid = VoiceID(SPEAKER_MODEL, VOICEPRINT, log)
+        except Exception as e:
+            log(f"Voice match unavailable: {e!r}")
         self.chat_question = None                      # (model, question, time): a typed reply answers it
         self.manual_listen = False                     # listening because of F20 / the mic button
         self.wake_on, self.demand_until, self.mic_reason = True, 0.0, "starting"
@@ -1582,6 +1787,7 @@ class Listener:
         self.last_voice = None                         # loudness/pitch of the latest stretch of speech
         self.last_asr = {"logprob": 0.0, "nospeech": 0.0, "comp": 0.0}
         self.wake_at, self.wake_judged = 0.0, False    # false-wake check ~4 s after "Hey Claude"
+        self.last_emb, self.last_score = None, 0.0     # voice match of the latest stretch of speech
         self.triage = TriageSession().start()          # "was that meant for me?" (no tools, ~1 s)
         try:
             self.ui.on_action = self._ui_action
@@ -1614,6 +1820,8 @@ class Listener:
                     self.hush()
                 elif kind == "mic":
                     self.listen_now()
+                elif kind == "enroll":
+                    self.start_enrollment()
                 elif self.speaking:
                     pass                               # ✓ / ✕ only act while listening
                 elif kind == "finish":
@@ -1690,6 +1898,12 @@ class Listener:
         self.wake_judged = True                        # you asked for it: no false-wake check
 
     def new_conversation(self):
+        if self.busy is not None:                      # finish (stop) the running task first
+            log("New conversation requested while a model is working: stopping that task first.")
+            self.deferred_new = True
+            self.stop_event.set()
+            self.ui.toast("Stopping the current task, then starting a new conversation.")
+            return
         if self.speaking:
             self.hush()
         self.pending = self.early_wake = None
@@ -1743,7 +1957,7 @@ class Listener:
         with self.reflect_lock:
             s = ClaudeSession(model).start()
             try:
-                result = s.ask(CATCHUP_HEAD + transcript + "\n\n" + REFLECT_PROMPT)
+                result = s.ask(CATCHUP_HEAD + transcript + "\n\n" + reflect_prompt(conv_label(path)))
             finally:
                 s.stop()
         log(f"Learned-memory catch-up ({path.name}, {model}): {result}")
@@ -1772,6 +1986,7 @@ class Listener:
         if not quiet:
             log("✕ clicked: cancelled.")
         self.manual_listen = False
+        self.enroll = None
         self.pending, self.early_wake = None, None
         self.followup_until = self.answer_until = self.open_until = 0.0
         self.wake_at, self.wake_judged = 0.0, False
@@ -1783,9 +1998,10 @@ class Listener:
     def apply_settings(self):
         """Re-read settings.json if it changed (Claude may edit it by voice). An effort change
         needs a fresh session for that model; model/tier changes simply apply to the next command."""
-        if not settings().reload():
-            return
+        settings().reload()
         for m, s in list(self.sessions.items()):
+            if self.busy is not None and self.busy.get("session") is s:
+                continue                               # never swap the session that's working right now
             if s.alive() and s.effort != settings()["effort"][m]:
                 log(f"Effort for {m} changed to {settings()['effort'][m]}; restarting that session.")
                 self.rotate(m, "settings changed")
@@ -1992,7 +2208,7 @@ class Listener:
     def _reflect_and_stop(self, old: ClaudeSession, why, mark=None):
         with self.reflect_lock:                        # one writer of learned.md at a time
             try:
-                result = old.ask(REFLECT_PROMPT)
+                result = old.ask(reflect_prompt(conv_label(mark[0] if mark else self.chatlog.path)))
                 log(f"Learned-memory review ({old.model}, {why}): {result}")
                 if mark and not result.startswith(("Sorry", "Claude Code isn't")):
                     self.chatlog.mark_reflected(*mark)
@@ -2033,7 +2249,8 @@ class Listener:
                         "voice": self.last_voice,      # your voice, to spot roommates joining in
                         "kind": "answer" if is_answer else kind,
                         "asr": [self.last_asr], "snr": [self.speech_snr(self.last_voice)],
-                        "checked": self.manual_listen}  # F20 / mic button: you asked for it, no filter
+                        "checked": self.manual_listen,  # F20 / mic button: you asked for it, no filter
+                        "emb": self.last_emb, "score": self.last_score}   # voice match of the wake phrase
         self.pending_deadline = time.time() + continue_s()
         if not self.wake_at:
             self.wake_at = time.time()
@@ -2051,6 +2268,10 @@ class Listener:
             if not ok:
                 self.false_wake(reason, text)
                 return
+        v = self.voiceid
+        if (v is not None and v.enrolled and p.get("emb") is not None and p["kind"] in ("wake", "followup")
+                and p.get("score", 0) >= v.threshold(settings()["voice_match_threshold"]) + 0.1):
+            v.add_adapt(p["emb"])                      # a confident, real command: keep the voiceprint current
         self.execute(text, p["t0"], shots=p["shots"], force_model=p["force_model"], is_answer=p["is_answer"])
 
     def check_early_wake(self):
@@ -2066,6 +2287,10 @@ class Listener:
         if self.speech_snr(voice_features(head)) < EARLY_WAKE_MIN_SNR_DB:
             return                                    # too faint to be someone at the laptop
         if self.spot_wake(head, at_start=True):
+            owner, sc = self.owner_check(head)
+            if owner is False:                        # someone else: not even the pill (checked again at the end)
+                log(f"Early wake spot from someone else ignored (voice match {sc:.2f}).")
+                return
             shots = self.grab()                      # pixels grabbed before the pill appears; PNGs in background
             self.ui.show("listen", "Listening…", "")  # visual cue now; the chime waits for small.en to confirm
             self.early_wake = {"shots": shots}
@@ -2088,9 +2313,96 @@ class Listener:
             return
         self.begin_pending(command, t0, shots=shots)
 
+    # ---- voice match: is it the owner talking?
+    def owner_check(self, audio):
+        """-> (True = the owner, False = someone else, None = can't tell / not set up / off, score)."""
+        v = self.voiceid
+        self.last_emb, self.last_score = None, 0.0
+        if v is None or not v.enrolled or not settings()["voice_match"]:
+            return None, 0.0
+        try:
+            emb = v.embed(audio)
+        except Exception as e:
+            log(f"Voice match failed: {e!r}")
+            return None, 0.0
+        if emb is None:
+            return None, 0.0                           # too little speech to judge
+        s = v.score(emb)
+        self.last_emb, self.last_score = emb, s
+        return s >= v.threshold(settings()["voice_match_threshold"]), s
+
+    def start_enrollment(self):
+        """'Hey Claude, learn my voice' / the chat's gear menu: 5 phrases -> the owner's voiceprint."""
+        if self.voiceid is None:
+            self.ui.show("error", "Voice match isn't available", "The speaker model is missing.", hide_after=6)
+            return
+        why = self.why_not_listening() if hasattr(self, "screen") else "starting"
+        if why and why != "on battery":
+            self.ui.toast(f"Can't listen right now ({why}).")
+            return
+        if self.speaking:
+            self.hush()
+        self.pending = self.early_wake = None
+        self.followup_until = self.answer_until = self.open_until = 0.0
+        self.wake_at, self.wake_judged = 0.0, True
+        if self.stream is None:
+            try:
+                self.open()
+            except Exception as e:
+                log(f"Couldn't open mic for voice setup: {e!r}")
+                return
+        self.reset_vad(keep_noise=True)
+        self.enroll = {"i": 0, "embs": [], "deadline": time.time() + 12, "misses": 0}
+        log("Voice match setup started.")
+        chime()
+        self.enroll_prompt()
+
+    def enroll_prompt(self, extra=""):
+        e = self.enroll
+        self.ui.show("listen", f"Voice setup · {e['i'] + 1} of {len(ENROLL_PHRASES)}",
+                     f"{extra}Say: “{ENROLL_PHRASES[e['i']]}”")
+
+    def enroll_sample(self, audio):
+        e = self.enroll
+        emb = self.voiceid.embed(audio)
+        e["deadline"] = time.time() + 12
+        if emb is None:
+            self.enroll_prompt("A little longer, please. ")
+            return
+        e["embs"].append(emb)
+        e["i"] += 1
+        e["misses"] = 0
+        if e["i"] < len(ENROLL_PHRASES):
+            self.enroll_prompt()
+            return
+        self.enroll = None
+        loo = self.voiceid.set_enrollment(e["embs"])
+        thr = self.voiceid.threshold(settings()["voice_match_threshold"])
+        log(f"Voice match set up: phrase similarity {', '.join(f'{x:.2f}' for x in loo)}; threshold {thr:.2f}.")
+        chime()
+        self.note("Voice match is set up: I'll only wake for your voice.")
+        self.ui.show("done", "Voice match is on", "I'll only wake for your voice now. F20 and the chat always work.",
+                     hide_after=6)
+
+    def enroll_tick(self, now):
+        e = self.enroll
+        if e and not self.in_speech and now > e["deadline"]:
+            e["misses"] += 1
+            if e["misses"] >= 2:
+                self.enroll = None
+                log("Voice match setup cancelled (nothing said).")
+                self.ui.show("error", "Voice setup cancelled", "Say “Hey Claude, learn my voice” to try again.",
+                             hide_after=5)
+            else:
+                e["deadline"] = now + 12
+                self.enroll_prompt("Still there? ")
+
     # ---- what to do with a finished stretch of speech
     def handle(self, audio):
         if len(audio) / RATE < MIN_UTTER_S:
+            return
+        if self.enroll is not None:                    # voice-match setup: each phrase is a sample
+            self.enroll_sample(audio)
             return
         start, t0 = self.utter_start, time.time()
         voice = voice_features(audio)
@@ -2099,9 +2411,10 @@ class Listener:
         # 1) you kept talking: add it to the command being collected
         if self.pending:
             if start <= self.pending_deadline + 0.1:
-                if sounds_like_someone_else(self.pending.get("voice"), voice):
-                    log(f"Sounds like someone else talking (you {self.pending.get('voice')}, now {voice}); "
-                        "not adding it, sending your command.")
+                owner, sc = self.owner_check(audio)
+                if owner is False or (owner is None and sounds_like_someone_else(self.pending.get("voice"), voice)):
+                    why = f"voice match {sc:.2f}" if owner is False else f"you {self.pending.get('voice')}, now {voice}"
+                    log(f"Sounds like someone else talking ({why}); not adding it, sending your command.")
                     self.run_pending()                 # stop listening; their words are dropped
                     return
                 more = self.transcribe(audio).strip()
@@ -2116,6 +2429,10 @@ class Listener:
 
         # 2) your answer to its question (no wake word needed). Counts if you STARTED in time.
         if self.answer_until and start <= self.answer_until:
+            owner, sc = self.owner_check(audio)
+            if owner is False:                         # someone else: keep waiting for your answer
+                log(f"Answer window: not your voice ({sc:.2f}); ignored.")
+                return
             text = self.transcribe(audio)
             if is_echo(text, self.spoken_reply):       # its own voice: keep waiting for the real answer
                 log(f"Answer window: ignored echo {text!r}")
@@ -2132,6 +2449,11 @@ class Listener:
 
         # 2b) you started talking within a few seconds of its reply: a command, no wake word needed
         if self.open_until and start <= self.open_until:
+            owner, sc = self.owner_check(audio)
+            if owner is False:
+                log(f"Open-mic: not your voice ({sc:.2f}); ignored.")
+                self.close_open_window()
+                return
             self.open_until = 0.0
             text = self.transcribe(audio)
             m = WAKE.search(text)
@@ -2148,6 +2470,11 @@ class Listener:
 
         # 3) the command after a bare "Hey Claude"
         if self.followup_until and start <= self.followup_until:
+            if not self.manual_listen:
+                owner, sc = self.owner_check(audio)
+                if owner is False:                     # not you: keep waiting for your command
+                    log(f"After the wake word: not your voice ({sc:.2f}); ignored.")
+                    return
             self.followup_until = 0.0
             text = self.transcribe(audio)
             if text.strip(" ,.!?"):
@@ -2159,6 +2486,10 @@ class Listener:
         # 4a) "Hey Claude" was already spotted while you were talking (pill is up): read the whole thing
         if self.early_wake is not None:
             ew, self.early_wake = self.early_wake, None
+            owner, sc = self.owner_check(audio)
+            if owner is False:                         # someone else said it: silently drop the pill
+                self.false_wake(f"not your voice, voice match {sc:.2f}")
+                return
             text = self.transcribe(audio)
             m = WAKE.search(text)
             if not m:                                  # the accurate model didn't hear "Hey Claude": noise
@@ -2182,6 +2513,10 @@ class Listener:
             log(f"heard: {text!r}")
         m = WAKE.search(text)
         if m:
+            owner, sc = self.owner_check(audio)
+            if owner is False:                         # someone else said "Hey Claude": no response at all
+                log(f"Wake word from someone else ignored (voice match {sc:.2f}): {text[:80]!r}")
+                return
             self.on_wake(text[m.end():], t0)
 
     # ---- while it's talking, only "Hey Claude" can stop it
@@ -2232,15 +2567,84 @@ class Listener:
         return (f"(A saved skill, {where}, was just tried for this command and failed: {out}. Do the request "
                 "yourself, and if fixing the skill's script is simple and safe, fix it too.)", None, None, None)
 
+    def undo_last(self, ctx):
+        """'Undo that'. Instant actions and skills with a known inverse are reversed right here.
+        Anything else goes to the model with what to reverse; the approval rules apply as always.
+        -> (reply if done here, else None; note for the model)."""
+        recent = [u for u in self.undo_stack if time.time() - u["t"] < 30 * 60]
+        if not recent:
+            return None, ("(The user said 'undo that'. Nothing the program tracked happened in the last 30 minutes. "
+                          "If this conversation shows something you did recently, reverse it if that's safe; "
+                          "anything destructive or outward-facing still needs the confirmation question first. "
+                          "Otherwise say there's nothing to undo.)")
+        u = recent[-1]
+        self.undo_stack.remove(u)
+        kind, args = u["undo"][0], u["undo"][1:]
+        what = f"they said “{u['command']}” and the reply was “{u['reply']}”"
+        to_model = ("(The user wants to undo the last action: " + what + ". Reverse it if it can be undone. "
+                    "Anything destructive or outward-facing (closing apps that may have unsaved work, deleting, "
+                    "sending; sent messages can't be unsent) needs the confirmation question first, as always. "
+                    "If it can't be undone, say so in one sentence.)")
+        try:
+            if kind == "volume":
+                set_volume(args[0])
+                reply = f"[silent] Volume back to {args[0]}%."
+            elif kind == "keys":
+                tap_key(args[0], args[1])
+                reply = f"[silent] {args[2]}"
+            elif kind == "window":
+                if not user32.IsWindow(args[0]):
+                    return None, to_model
+                user32.ShowWindow(args[0], args[1])
+                reply = "[silent] Window put back."
+            elif kind == "opened":                     # close it again, but only if it was just opened
+                key = LocalActions._alias_for(args[0])
+                if time.time() - u["t"] > 120 or key is None or APP_ALIASES.get(key) is None:
+                    return None, to_model
+                r = subprocess.run(["taskkill", "/IM", f"{APP_ALIASES[key]}.exe"], capture_output=True,
+                                   creationflags=NO_WINDOW)
+                if r.returncode != 0:
+                    return None, to_model
+                reply = f"[silent] Closed {args[0]} again."
+            elif kind == "closed":                     # open it again
+                app = self.local.find_app(args[0])
+                if not app:
+                    return None, to_model
+                allow_foreground()
+                os.startfile(f"shell:AppsFolder\\{app[1]}")
+                reply = f"[silent] Reopened {app[0]}."
+            elif kind == "skill":
+                sk, values, undo_value = args[0], args[1], (args[2] if len(args) > 2 else None)
+                fresh = {s.id: s for s in self.skills.load()}.get(sk.id)
+                if (fresh is None or not fresh.undo_script or fresh.blocked or fresh.undo_approval
+                        or not self.skills.is_verified(fresh)):
+                    return None, to_model + (f" (Its skill '{sk.name}' has no undo that can run by itself.)")
+                ok, out = self.skills.run_undo(fresh, values, undo_value)
+                if not ok:
+                    return None, to_model + f" (Its skill's undo script failed: {out})"
+                reply = out
+            else:                                      # a model's action
+                return None, to_model
+        except Exception as e:
+            log(f"Undo failed: {e!r}")
+            return None, to_model + f" (Undoing it on the laptop failed: {e!r}.)"
+        log(f"UNDO ({kind}): {u['command']} -> {reply}")
+        return reply, ""
+
     def note(self, text):
         """A small grey line in the chat (and its log), e.g. 'Stopped.'"""
         self.chatlog.append("note", text)
         self.ui.chat_add({"role": "note", "text": text, "t": time.time()})
 
     def execute(self, command, t0, shots=None, force_model=None, is_answer=False, source="voice"):
-        """Run one command (spoken or typed) and show / speak the reply. Typed: the reply is text only."""
+        """Run one command (spoken or typed). Instant actions and skills run right here; a model's work
+        runs on a worker thread (_work -> finish_reply via the main loop), so the mic and the chat keep
+        working meanwhile. If a model is already working, the command joins that task (follow_up)."""
         typed = source == "typed"
         self.last_activity = time.time()
+        if self.busy is not None:
+            self.follow_up(command, t0, shots, source)
+            return
         self.stop_event.clear()
         self.chat_question = None
         # the chat window already shows what you typed; spoken commands are added here
@@ -2260,87 +2664,225 @@ class Listener:
         if isinstance(shots, ScreenGrab):
             shots = shots.get()                       # usually already finished while you were talking
         self.ui.show("think", "Got it", f"“{command}”")
-        reply, handler, session = None, "local", None
-        skill_note, skill_name, verify_skill = "", None, None
+        ctx = {"command": command, "t0": t0, "typed": typed, "source": source, "is_answer": is_answer,
+               "handler": "local", "session": None, "model": None, "label": None, "body": None,
+               "skill_name": None, "verify_skill": None, "followups": [], "undo": None}
+        reply, skill_note = None, ""
+        c = normalize_cmd(command)
+        if force_model is None and ENROLL_RE.fullmatch(c):
+            log(f"COMMAND (local): {command} -> voice match setup")
+            self.start_enrollment()
+            return
+        if force_model is None and FORGET_VOICE_RE.fullmatch(c) and self.voiceid is not None:
+            self.voiceid.forget()
+            reply = "Okay, I forgot your voice. Voice match is off until you set it up again."
+            force_model = "local"                      # (skip the other instant actions below)
         if force_model is None:
-            hit = None
-            try:
-                hit = self.skills.match(command)       # saved script skills come first...
-            except Exception as e:
-                log(f"Skill matching failed: {e!r}")
-            if hit:
-                skill_note, skill_name, verify_skill, reply = self.try_skill(*hit)
+            if UNDO_RE.fullmatch(c):
+                reply, skill_note = self.undo_last(ctx)
             else:
-                reply = self.local.try_handle(command)  # ...then the built-in instant actions
+                hit = None
+                try:
+                    hit = self.skills.match(command)   # saved script skills come first...
+                except Exception as e:
+                    log(f"Skill matching failed: {e!r}")
+                if hit:
+                    skill_note, ctx["skill_name"], ctx["verify_skill"], reply = self.try_skill(*hit)
+                    if reply is not None:
+                        ctx["undo"] = ("skill", hit[0], hit[1], self.skills.last_undo)
+                else:
+                    reply = self.local.try_handle(command)  # ...then the built-in instant actions
+                    if reply is not None:
+                        ctx["undo"] = self.local.last_undo
         if reply is not None:
-            if skill_name:
-                handler = "skill"
-                log(f"COMMAND (skill '{skill_name}'): {command} -> {reply}")
+            if ctx["skill_name"]:
+                ctx["handler"] = "skill"
+                log(f"COMMAND (skill '{ctx['skill_name']}'): {command} -> {reply}")
             else:
                 log(f"COMMAND (local): {command} -> {reply}")
-        else:
-            model, visual = (force_model, False) if force_model else route(command)
-            if skill_note and model == "haiku":       # running / fixing a skill: not a job for Haiku
-                model = "sonnet"
-            handler, label = model, MODEL_LABEL[model]
-            session = self.sessions[model]
-            self.ui.show("think", f"Thinking · {label}", f"“{command}”")
-            if not typed or SPEAK_REQ_RE.search(command):
-                self.voice.warm(180)                   # speaker stays awake while Claude works
-            how = "typed" if typed else "spoken"
-            body = f"(The user's {how} answer to your question:) {command}" if is_answer else command
-            if typed:
-                body = TYPED_NOTE + body
-            if skill_note:
-                body += "\n\n" + skill_note
-            if visual and shots:
-                listing = "\n".join(f"  - {p}  ({d})" for p, d in shots)
-                body += ("\n\n(Screen context: screenshots of all the user's screens, taken when they spoke:\n"
-                         f"{listing}\nRead the relevant ones first if the command refers to something on screen; "
-                         "start with the one that has the window the user was using.)")
-            prompt = self.context_preface(session) + body
-            log(f"COMMAND ({model}{', answer' if is_answer else ''}"
-                f"{f', +{len(shots)} screens' if visual and shots else ''}): {command}")
-            allow_foreground()
-            progress = lambda d: self.ui.show("act", f"Working · {label}", d)
-            reply = session.ask(prompt, progress, stop=self.stop_event)
-            log(f"  REPLY ({time.time() - t0:.1f}s): {reply}")
-            if reply != STOPPED and model == "haiku" and not is_answer and CANT_RE.search(reply):
-                # Haiku has no connectors; if it says it can't reach something, let Sonnet try.
-                session.seen, session.fresh = len(self.history), False
-                handler, label, session = "sonnet", MODEL_LABEL["sonnet"], self.sessions["sonnet"]
-                log("  Haiku couldn't do it; retrying with Sonnet.")
-                self.ui.show("think", f"Thinking · {label}", f"“{command}”")
-                reply = session.ask(self.context_preface(session) + body,
-                                    lambda d: self.ui.show("act", f"Working · {label}", d), stop=self.stop_event)
-                log(f"  REPLY ({time.time() - t0:.1f}s, Sonnet): {reply}")
+            self.finish_reply(ctx, reply)
+            return
+        model, visual = (force_model, False) if force_model else route(command)
+        if skill_note and model == "haiku":           # running / fixing a skill or an undo: not for Haiku
+            model = "sonnet"
+        label = MODEL_LABEL[model]
+        session = self.sessions[model]
+        self.ui.show("think", f"Thinking · {label}", f"“{command}”")
+        if not typed or SPEAK_REQ_RE.search(command):
+            self.voice.warm(180)                       # speaker stays awake while Claude works
+        how = "typed" if typed else "spoken"
+        body = f"(The user's {how} answer to your question:) {command}" if is_answer else command
+        if typed:
+            body = TYPED_NOTE + body
+        if skill_note:
+            body += "\n\n" + skill_note
+        if visual and shots:
+            listing = "\n".join(f"  - {p}  ({d})" for p, d in shots)
+            body += ("\n\n(Screen context: screenshots of all the user's screens, taken when they spoke:\n"
+                     f"{listing}\nRead the relevant ones first if the command refers to something on screen; "
+                     "start with the one that has the window the user was using.)")
+        prompt = self.context_preface(session) + body
+        log(f"COMMAND ({model}{', answer' if is_answer else ''}"
+            f"{f', +{len(shots)} screens' if visual and shots else ''}): {command}")
+        allow_foreground()
+        ctx.update(handler=model, model=model, label=label, session=session, body=body)
+        self.busy = ctx
+        threading.Thread(target=self._work, args=(ctx, prompt), daemon=True).start()
 
+    def _work(self, ctx, prompt):
+        """Worker thread: the model call. The result goes back to the main loop (collect_results)."""
+        progress = lambda d: self.ui.show("act", f"Working · {ctx['label']}", d)
+        try:
+            reply = ctx["session"].ask(prompt, progress, stop=self.stop_event)
+            log(f"  REPLY ({time.time() - ctx['t0']:.1f}s): {reply}")
+            # Escalation: a model that can't do it (an [escalate] marker, or "I can't see that from this model,
+            # ask again...") never gets its reply shown or spoken; the SAME command re-runs one model up.
+            why = escalation_reason(reply, ctx["model"])
+            while why and not self.stop_event.is_set():
+                old, nxt = ctx["session"], NEXT_MODEL[ctx["model"]]
+                old.seen, old.fresh = len(self.history), False
+                s2 = self.sessions[nxt]
+                log(f"  ESCALATE: {MODEL_LABEL[ctx['model']]} couldn't do it ({why}); re-running on {MODEL_LABEL[nxt]}.")
+                ctx.update(handler=nxt, model=nxt, label=MODEL_LABEL[nxt], session=s2, escalated=True)
+                self.ui.show("think", f"Thinking · {ctx['label']}", f"“{ctx['command']}”")
+                body = ctx["body"]
+                if ctx["followups"]:
+                    body += "\n\n(The user also added, while it was being worked on: " + \
+                            "; ".join(f"“{f}”" for f in ctx["followups"]) + ")"
+                reply = s2.ask(self.context_preface(s2) + body, progress, stop=self.stop_event)
+                log(f"  REPLY ({time.time() - ctx['t0']:.1f}s, {ctx['label']}): {reply}")
+                why = escalation_reason(reply, ctx["model"])
+            if reply != STOPPED and ESCALATE_RE.search(reply):   # even Opus couldn't: never "ask again"
+                reply = ESCALATE_RE.sub("", reply).strip() or "Sorry, I couldn't do that one."
+        except Exception as e:
+            log(f"  Claude request failed: {e!r}")
+            reply = "Sorry, something went wrong."
+        self.results.put((ctx, reply))
+
+    def collect_results(self):
+        """Main loop: a model finished -> show / speak its reply; then anything that had to wait."""
+        while True:
+            try:
+                ctx, reply = self.results.get_nowait()
+            except queue.Empty:
+                break
+            self.busy = None
+            try:
+                self.finish_reply(ctx, reply)
+            except Exception as e:
+                log(f"Error finishing a reply: {e!r}")
+                self.ui.show("error", "Something went wrong", str(e)[:120], hide_after=6)
+        while self.busy is None and (self.deferred or self.deferred_new):
+            if self.deferred_new:
+                self.deferred_new = False
+                self.new_conversation()
+                continue
+            command, t0, shots, source = self.deferred.pop(0)
+            self.execute(command, t0, shots=shots, source=source)
+
+    def follow_up(self, command, t0, shots, source):
+        """A command while a model is still working. Instant actions and ready skills run right away;
+        "stop" stops the task; anything else is added to the running task (Claude sees it mid-task)."""
+        ctx, typed = self.busy, source == "typed"
+        c = normalize_cmd(command)
+        if STOP_TASK_RE.fullmatch(c):
+            log(f"FOLLOW-UP '{command}': stopping the running task.")
+            if not typed:
+                self.ui.chat_add({"role": "user", "text": command, "source": "voice", "t": time.time()})
+            self.chatlog.append("user", command, source=source)
+            self.stop_event.set()
+            return
+        hit, note, quick = None, "", None
+        if not UNDO_RE.fullmatch(c):
+            try:
+                hit = self.skills.match(command)
+            except Exception:
+                hit = None
+            if hit:
+                note, name, verify, reply = self.try_skill(*hit)
+                if reply is not None:
+                    quick = ({"handler": "skill", "skill_name": name, "undo": ("skill", hit[0], hit[1], self.skills.last_undo)}, reply)
+            else:
+                reply = self.local.try_handle(command)
+                if reply is not None:
+                    quick = ({"handler": "local", "skill_name": None, "undo": self.local.last_undo}, reply)
+        if quick:                                      # independent of the running task: do it now
+            self.chatlog.append("user", command, source=source)
+            if not typed:
+                self.ui.chat_add({"role": "user", "text": command, "source": "voice", "t": time.time()})
+            qctx = {"command": command, "t0": t0, "typed": typed, "source": source, "is_answer": False,
+                    "session": None, "model": None, "label": None, "body": None, "verify_skill": None,
+                    "followups": [], **quick[0]}
+            log(f"COMMAND while {ctx['label']} works ({qctx['handler']}): {command} -> {quick[1]}")
+            self.finish_reply(qctx, quick[1])
+            if self.busy is not None:
+                self.ui.show("act", f"Working · {ctx['label']}", "Still on your earlier request")
+            return
+        how = "typed" if typed else "spoken"
+        msg = (f"(Follow-up from the user ({how}) while you're still working on this: add it to the current "
+               f"task.) {command}")
+        if note:
+            msg += "\n\n" + note
+        if shots and VISUAL_RE.search(command):
+            if isinstance(shots, ScreenGrab):
+                shots = shots.get()
+            if shots:
+                msg += ("\n\n(New screenshots, taken as they said it: "
+                        + "; ".join(f"{p} ({d})" for p, d in shots) + ")")
+        if ctx["session"] is not None and ctx["session"].inject(msg):
+            ctx["followups"].append(command)
+            self.chatlog.append("user", command, source=source, followup=True)
+            if not typed:
+                self.ui.chat_add({"role": "user", "text": command, "source": "voice", "t": time.time()})
+            log(f"FOLLOW-UP added to the running task ({ctx['label']}): {command}")
+            self.ui.show("act", f"Working · {ctx['label']}", f"Added: “{command}”")
+        else:                                          # it finished a moment ago: run it as a new command
+            log(f"FOLLOW-UP arrived as the task finished; running it next: {command}")
+            self.deferred.append((command, t0, shots, source))
+
+    def finish_reply(self, ctx, reply):
+        """Show / speak / log a reply (instant action, skill or model). Runs on the main loop."""
+        command, typed, source, is_answer = ctx["command"], ctx["typed"], ctx["source"], ctx["is_answer"]
+        handler, session, skill_name = ctx["handler"], ctx["session"], ctx.get("skill_name")
+        if ctx["followups"]:
+            command = command + "".join(f" (follow-up: {f})" for f in ctx["followups"])
+        quiet_mic = not self.in_speech and self.pending is None
         if reply == STOPPED:                           # Stop pressed: that session restarted fresh
             self.history.append({"t": time.time(), "handler": handler, "source": source,
                                  "command": command, "reply": "(stopped by the user before replying)"})
             self.note("Stopped.")
-            self.flush()
+            if quiet_mic:
+                self.flush()
             self.voice.cool()
             self.ui.hide()
             self.stop_event.clear()
             return
         if session is not None and re.search(r"\[ignore\]", reply, re.I):
-            if typed:                                  # typed is always meant for it
+            if typed or ctx["followups"]:              # typed (or followed up on) is always meant for it
                 reply = chat_text(reply) or "Okay."
             else:
                 # Claude decided it wasn't meant for it (background talk / gibberish): no response at all
                 log("  Claude marked it [ignore]: no response.")
                 session.seen, session.fresh = len(self.history), False
                 self.note("Ignored: that didn't sound like it was meant for me.")
-                self.flush()
+                if quiet_mic:
+                    self.flush()
                 self.voice.cool()
                 self.ui.hide()
                 return
         # typed prompt + "say it out loud" (or Claude tagged the reply [speak]): read the reply aloud too
         speak_typed = typed and bool(SPEAK_REQ_RE.search(command) or SPEAK_TAG_RE.search(reply))
         text = chat_text(reply)
+        verify_skill = ctx.get("verify_skill")
         if verify_skill is not None and not reply.startswith(("Sorry", "Claude Code isn't")) and "?" not in reply:
             self.skills.mark_verified(verify_skill)   # its first run went through the model's checked tools
+        ok = not reply.startswith(("Sorry", "Claude Code isn't"))
+        if ctx.get("undo") and ok:
+            self.undo_stack.append({"t": time.time(), "command": ctx["command"], "reply": text, "undo": ctx["undo"]})
+            self.undo_stack = self.undo_stack[-20:]
+        elif session is not None and ok:
+            self.undo_stack.append({"t": time.time(), "command": command, "reply": text, "undo": ("model", handler)})
+            self.undo_stack = self.undo_stack[-20:]
         self.history.append({"t": time.time(), "handler": handler, "source": source, "skill": skill_name,
                              "command": f"(answer) {command}" if is_answer else command,
                              "reply": text})
@@ -2357,7 +2899,9 @@ class Listener:
         if asked:
             self.chat_question = (handler, spoken, time.time())   # a typed reply in the chat answers it
         self.spoken_reply = spoken
-        self.flush()                                   # drop whatever the mic heard while it was thinking
+        if quiet_mic:
+            self.flush()                               # drop whatever the mic heard while it was thinking
+        rotate = session is not None and session.turns >= MAX_TURNS
         if speak_typed and spoken:                     # typed, but asked to hear it: speak, no open mic after
             log("  Typed prompt asked to hear the reply: speaking it.")
             self.ui.show("ask" if asked else ("done" if ok else "error"),
@@ -2367,11 +2911,7 @@ class Listener:
             self.speaking = True
             self.ui.speaking(True)
             self.voice.speak(spoken)
-            self.last_activity = time.time()
-            if session is not None and session.turns >= MAX_TURNS:
-                self.rotate(handler, f"{MAX_TURNS} commands")
-            return
-        if typed:                                      # text only: no voice, no open mic
+        elif typed:                                    # text only: no voice, no open mic
             self.voice.cool()
             if silent and ok:
                 self.ui.show("done", "Done", shown, hide_after=2.5)
@@ -2379,30 +2919,23 @@ class Listener:
                 self.ui.show("ask" if asked else ("done" if ok else "error"),
                              "Question" if asked else ("Done" if ok else "Couldn't do that"), shown)
                 self.ui.linger(None if keep or asked else settings()["hud_seconds_after_reply"])
-            self.last_activity = time.time()
-            if session is not None and session.turns >= MAX_TURNS:
-                self.rotate(handler, f"{MAX_TURNS} commands")
-            return
-        if silent and ok:                              # simple, self-evident action: no voice, brief pill
+        elif silent and ok:                            # simple, self-evident action: no voice, brief pill
             self.voice.cool()
             self.ui.show("done", "Done", shown, hide_after=2.5)
-            self.last_activity = time.time()
-            if session is not None and session.turns >= MAX_TURNS:
-                self.rotate(handler, f"{MAX_TURNS} commands")
-            return
-        if asked:
-            self.ui.show("ask", "Question", shown)
         else:
-            self.ui.show("done" if ok else "error", "Done" if ok else "Couldn't do that", shown)
-        # Talk in the background: the main loop keeps running so "Hey Claude" can interrupt.
-        # The pill stays up until the voice finishes (see finish_speaking), then lingers.
-        self.after_speech = ("ask", handler, shown) if asked else ("done", keep, shown)
-        self.barge_ring.clear(); self.barge_next = time.time() + BARGE_EVERY_S
-        self.speaking = True
-        self.ui.speaking(True)
-        self.voice.speak(spoken)
+            if asked:
+                self.ui.show("ask", "Question", shown)
+            else:
+                self.ui.show("done" if ok else "error", "Done" if ok else "Couldn't do that", shown)
+            # Talk in the background: the main loop keeps running so "Hey Claude" can interrupt.
+            # The pill stays up until the voice finishes (see finish_speaking), then lingers.
+            self.after_speech = ("ask", handler, shown) if asked else ("done", keep, shown)
+            self.barge_ring.clear(); self.barge_next = time.time() + BARGE_EVERY_S
+            self.speaking = True
+            self.ui.speaking(True)
+            self.voice.speak(spoken)
         self.last_activity = time.time()
-        if session is not None and session.turns >= MAX_TURNS:
+        if rotate:
             self.rotate(handler, f"{MAX_TURNS} commands")
 
     def finish_speaking(self):
@@ -2467,23 +3000,52 @@ class Listener:
         """On battery the mic opens only for F20 / the mic button: until that command, its reply
         and the follow-up windows after it are over."""
         return bool(time.time() < self.demand_until or self.pending is not None or self.followup_until
+                    or self.enroll is not None
                     or self.answer_until or self.open_until or self.in_speech
                     or (self.speaking and not (self.after_speech and self.after_speech[0] == "typed")))
 
     def housekeeping(self):
         """Things that happen whether or not the mic is open (chat, F20, settings, idle end)."""
         now = time.time()
+        self.collect_results()                         # a model finished working
         self.handle_ui_actions()                       # ✓ / ✕, typed prompts, Stop, F20, new conversation
         if self.speaking and not self.voice.is_speaking():
             self.finish_speaking()
+        if self.enroll is not None:
+            self.enroll_tick(now)
         if now >= self.settings_check:
             self.settings_check = now + 1.0
             self.apply_settings()
-        if self.history and not self.speaking and now - self.last_activity > CONTEXT_WINDOW_S:
+        if (self.history and not self.speaking and self.busy is None
+                and now - self.last_activity > CONTEXT_WINDOW_S):
             self.end_conversation("15 minutes idle")
+        self.show_notice()
+
+    def show_notice(self):
+        """A heads-up waits for a quiet moment: nothing being said, collected, worked on or spoken."""
+        if self.notices.empty() or self.busy is not None or self.speaking or self.pending is not None:
+            return
+        if (self.in_speech or self.enroll is not None or self.followup_until or self.answer_until
+                or self.open_until or self.early_wake is not None):
+            return
+        try:
+            title, detail = self.notices.get_nowait()
+        except queue.Empty:
+            return
+        log(f"HEADS-UP: {title} — {detail}")
+        self.ui.show("notice", title, detail)          # pill only, never spoken (user choice)
+        self.ui.linger(None)                           # stays until you move the mouse, click or type
+        self.ui.chat_add({"role": "note", "text": f"Heads-up · {title}: {detail}", "t": time.time()})
 
     def run(self):
         self.screen, self.lock_poll = ScreenWatcher(), 0.0
+        try:
+            from headsup import HeadsUps
+            HeadsUps(notify=lambda title, detail: self.notices.put((title, detail)), power=power_info,
+                     awake=lambda: self.screen.awake() and not is_locked_now(), settings=lambda: settings().data,
+                     make_session=lambda: HeadsUpSession().start(), state_path=HEADSUP_STATE, log=log).start()
+        except Exception as e:
+            log(f"Heads-ups unavailable: {e!r}")
         while True:
             reason = self.why_not_listening()
             self.wake_on = reason is None              # the wake word itself: only plugged in / docked
@@ -2641,6 +3203,9 @@ MEMORY_STUBS = {
                   "to avoid. Keep under 40 short bullets.\n\n",
     "about-user.md": "# About the user\n\n(Write a short profile here: who you are, what you do, how you like "
                      "answers. Hey Claude reads it only when a request is about you.)\n",
+    "sessions.md": "# What the user has been working on (session memory)\n\nUpdated automatically at the end of "
+                   "each conversation: one bullet per conversation, newest first, with anything left unfinished. "
+                   "At most 12 bullets.\n\n",
 }
 
 
@@ -2724,7 +3289,11 @@ def main():
             fast = load_fast_whisper()
             voice = Voice()
             lis = Listener(model, voice, overlay, fast_model=fast, chatlog=chatlog)
-            overlay.show("done", "Hey Claude is ready", "Say “Hey Claude”, or tap F20 to type", hide_after=3)
+            if lis.voiceid is not None and not lis.voiceid.enrolled:
+                overlay.show("done", "Hey Claude is ready",
+                             "New: say “Hey Claude, learn my voice” to turn on voice match", hide_after=8)
+            else:
+                overlay.show("done", "Hey Claude is ready", "Say “Hey Claude”, or tap F20 to type", hide_after=3)
             log("Ready.")
             lis.run()
         except Exception as e:

@@ -10,5 +10,6 @@
   "args": ["{n}"],
   "reply": "[silent] Brightness {n}%.",
   "approval": false,
-  "timeout": 10
+  "timeout": 10,
+  "undo": {"script": "run.ps1", "args": ["{undo}"], "reply": "[silent] Brightness back to {undo}%."}
 }
