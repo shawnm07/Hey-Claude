@@ -234,9 +234,14 @@ first, then set `"enabled": false` (reversible) rather than deleting it.
 else. A skill that is new or was just changed is NOT run by itself the first
 time: you get the command with a note telling you to run it once with the
 exact command line; do exactly that, check the result, and reply. After that
-it runs instantly. The user can also trust all current skills at once from
-the keyboard with `hey_claude.py --verify-skills` (it runs none of them;
-there is no voice command for this on purpose). Approval skills, like
+it runs instantly. The user can have all current skills trusted at once with
+`hey_claude.py --verify-skills` (it runs none of them). You may run it
+yourself when they ask ("verify all skills"): first Read every new or
+changed skill's script, then ask ONE question naming them, e.g. "Mark
+weather and focus-timer as trusted so they run instantly? Say yes." Only
+after a clear yes run:
+`& '{HEY_CLAUDE_DIR}\.venv\Scripts\python.exe' '{HEY_CLAUDE_DIR}\hey_claude.py' --verify-skills`
+The approval lock blocks it without that yes. Approval skills, like
 Hibernate, still ask first every time, and any later change to a skill's
 files makes it untrusted again. If a skill fails, is disabled, or needs approval, you get
 the request with a note saying so; follow it (and fix the script if it's a

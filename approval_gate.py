@@ -28,6 +28,7 @@ except Exception:
     command = raw.lower()                              # can't parse: still check the raw text (fail closed)
 presses_send = (
     "send-compose" in command
+    or "verify-skills" in command                      # trusting skills needs the user's yes too
     or re.search(r"\^\{enter\}|\^~|ctrl\s*\+\s*enter|vk_return.{0,80}vk_control|vk_control.{0,80}vk_return", command)
 )
 if not presses_send:
@@ -43,6 +44,11 @@ if fresh:
     TOKEN.unlink(missing_ok=True)                      # one approval = one send
     sys.exit(0)
 
+if "verify-skills" in command:
+    print("Blocked by the approval lock: marking skills as trusted needs the user's clear yes first. Read the "
+          "new or changed skills' scripts, then ask ONE question naming them, and wait for a clear yes.",
+          file=sys.stderr)
+    sys.exit(2)
 print("Blocked by the approval lock: pressing Send needs the user's approval first (a clear yes, spoken or "
       "typed in the chat window). "
       "Ask ONE confirmation question that names the recipient(s), the subject and how it starts, "
