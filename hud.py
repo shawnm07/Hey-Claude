@@ -841,6 +841,9 @@ class Hud:
         my = y + bh + px(4)
         who = "You" if you else "Claude"
         label = MODEL_LABEL.get(m.get("handler", ""), "")
+        if m.get("handler") == "skill":
+            sk = str(m.get("skill") or "")
+            label = "Skill" + (f": {sk[:28]}" if sk else "")
         bits = [who] + ([label] if label else []) + [_clock(m.get("t", time.time()))]
         meta = "  ·  ".join(bits)
         anchor = "ne" if you else "nw"

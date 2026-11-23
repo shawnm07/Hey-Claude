@@ -1,0 +1,14 @@
+{
+  "name": "Screen brightness",
+  "description": "Set the built-in screen's brightness to a percentage.",
+  "triggers": [
+    "(?:set|change|turn|put|make) (?:the |my )?(?:screen )?brightness (?:to |at )?{n}(?: ?%| percent)?",
+    "(?:screen )?brightness {n}(?: ?%| percent)?"
+  ],
+  "params": {"n": {"type": "int", "min": 0, "max": 100}},
+  "script": "run.ps1",
+  "args": ["{n}"],
+  "reply": "[silent] Brightness {n}%.",
+  "approval": false,
+  "timeout": 10
+}

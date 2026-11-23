@@ -16,3 +16,5 @@ workspace/screen/
 workspace/settings.json
 workspace/.approval
 triage/
+workspace/skills/
+skills-verified.json

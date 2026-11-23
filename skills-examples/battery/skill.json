@@ -1,0 +1,13 @@
+{
+  "name": "Battery status",
+  "description": "Say the battery level, whether it's charging, and the time left on battery.",
+  "triggers": [
+    "(?:what'?s|what is|how'?s|how is|check|tell me) (?:my |the )?battery(?: level| percentage| life| status)?",
+    "(?:my )?battery(?: level| percentage| life| status)?",
+    "how much battery (?:do i have|is left|have i got)(?: left)?"
+  ],
+  "script": "run.ps1",
+  "reply": "{output}",
+  "approval": false,
+  "timeout": 10
+}

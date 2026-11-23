@@ -28,7 +28,7 @@ conversation, or hold **F20** to talk.
 - **Keep talking.** It keeps collecting your command while you speak. Short pauses are fine. A **check button**
   sends it now; **X** or Esc cancels.
 - **Instant actions** with no model call (~0.2 s): open/close apps, exact volume, media keys,
-  maximize/minimize, the time and date.
+  maximize/minimize, the time and date, plus any **script skills** you've taught it (see below).
 - **The right model for the job.** Simple commands go to Haiku. Screen, tasks, calendar and multi-step work
   go to Sonnet. Research, writing and planning go to Opus. Say "use Opus…" to choose. Each model is a
   long-running `claude -p` session, so there's no start-up delay.
@@ -61,6 +61,45 @@ conversation, or hold **F20** to talk.
 
 Each message has a copy button (or right-click it). At the top of the chat you can load the previous
 conversation.
+
+### Script skills: teach it new instant commands
+
+Say *"whenever I say 'flip a coin', answer heads or tails — make that a skill"* (or *"make that a skill"* right
+after it did something useful). Claude writes a small script and a manifest into `workspace/skills/<name>/`, tests it
+once, and from then on that command runs the script **directly, with no model call**. That's about as fast as the
+built-in instant commands (a PowerShell skill takes ~0.3 s). The chat labels these replies **Skill: name**.
+
+```json
+{
+  "name": "Screen brightness",
+  "triggers": ["(?:set|change) (?:the )?brightness (?:to )?{n}(?: ?%| percent)?", "brightness {n}(?: ?%| percent)?"],
+  "params": {"n": {"type": "int", "min": 0, "max": 100}},
+  "script": "run.ps1",
+  "args": ["{n}"],
+  "reply": "[silent] Brightness {n}%.",
+  "approval": false,
+  "timeout": 10
+}
+```
+
+Triggers are regular expressions matched against the whole command, and `{n}` captures a parameter (number words
+like "seventy five" work too). `reply` can use `{output}` (what the script printed), or `[silent]` to just flash
+"Done". Two samples ship in [`skills-examples/`](skills-examples): screen brightness and battery status. See
+[`skills.py`](skills.py) for the full format.
+
+Skills can't get around the safety rules:
+
+- **A new or changed skill is not trusted yet.** Its first run goes through the model's own tools, so Claude Code's
+  permission checks see it. Only then does it run instantly. The trust list lives outside the workspace.
+- **Anything destructive or outward-facing always asks first.** A static scan forces approval for scripts that
+  delete, overwrite, kill, shut down, change settings or send. The model then asks the confirmation question and
+  runs the script only after a clear yes.
+- **No downloaded code, no installs.** Scripts that download-and-run code or install software are disabled.
+- **Timeouts and sandboxed arguments.** Each run has a timeout (default 15 s, at most 60). Spoken values are passed as
+  plain arguments, never through a shell. Scripts must be `.ps1` or `.py` inside their own folder, and triggers so
+  broad they'd catch every command are rejected.
+- If a skill fails, the request falls back to the normal model, along with the error, so it can do the job (and
+  fix the script).
 
 ### On battery
 
@@ -122,6 +161,7 @@ On first run Hey Claude creates its private workspace files, which are git-ignor
 | `workspace/memory/` | `permanent.md` (what you told it to remember), `learned.md` (its own notes), `about-user.md` (your profile) |
 | `workspace/settings.json` | Models per tier, effort, voice, timings, `chat_hud`. It can edit this by voice ("use Sonnet for simple stuff"). |
 | `workspace/conversations/` | One JSON-lines log per conversation, append-only |
+| `workspace/skills/` | Your script skills (starts with the samples) |
 
 It may change its settings, instructions and memory by voice, but never its own code. For that it tells you
 to ask in the Claude app.
@@ -162,6 +202,8 @@ A few details that took some figuring out:
 | `hey_claude.py` | Listener, wake word, routing, Claude sessions, voice, local actions |
 | `hud.py` | The status pill and chat window (Tkinter, canvas-rendered, light markdown) |
 | `chatlog.py` | Append-only conversation logs |
+| `skills.py` | Script skills: manifests, trigger matching, safety scan, runner |
+| `skills-examples/` | Sample skills, copied to `workspace/skills/` on first run |
 | `approval_gate.py` | Claude Code `PreToolUse` hook that enforces the email-send approval lock |
 | `tools/` | Gmail compose / send helpers (browser only; no email API access) |
 | `workspace/CLAUDE.example.md` | Template for the assistant's instructions |

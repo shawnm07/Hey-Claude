@@ -122,6 +122,9 @@ DEFAULT_SETTINGS = {
     "chat_hud": True,              # false = the old status pill only (no chat window); read at startup
 }
 CONV_DIR = WORKSPACE / "conversations"   # one .jsonl log per conversation (append-only, never deleted)
+SKILLS_DIR = WORKSPACE / "skills"        # script skills: instant commands the models can create (skills.py)
+SKILLS_VERIFIED = HERE / "skills-verified.json"   # skills whose first run went through a model (kept out of
+SKILL_EXAMPLES = HERE / "skills-examples"         # the workspace, so a model can't mark its own skill trusted)
 
 
 class Settings:
@@ -267,7 +270,7 @@ OPUS_RE = re.compile(
 SONNET_RE = re.compile(
     r"\b(tasks?|to-?dos?|tick ?tick|remind(?:er)?s?|calendar|schedule|events?|meetings?|"
     r"summari[sz]e|find|search|look up|organi[sz]e|set up|and then|after that|fix|why|how do|"
-    r"configure|install)\b", re.I)
+    r"configure|install|skills?|whenever i say|every time i say)\b", re.I)
 # "that" only counts when it points at something ("add that to...", "close that"), not
 # when it joins a sentence ("remember that the test word is...").
 VISUAL_RE = re.compile(
@@ -1544,9 +1547,12 @@ class LocalActions:
 class Listener:
     def __init__(self, model, voice: Voice, overlay: Overlay, fast_model=None, chatlog=None):
         from chatlog import ChatLog
+        from skills import SkillBook
         self.model, self.voice, self.ui = model, voice, overlay
         self.fast_model = fast_model or model         # spots the wake word; `model` transcribes commands
         self.local = LocalActions()
+        self.skills = SkillBook(SKILLS_DIR, SKILLS_VERIFIED, HERE / ".venv" / "Scripts" / "python.exe", log)
+        self.skills.load()
         self.sessions = {m: ClaudeSession(m) for m in ("haiku", "sonnet", "opus")}
         for m in ("haiku", "sonnet"):                 # pre-start (no cost until used); opus starts on demand
             self.sessions[m].start()
@@ -1632,7 +1638,9 @@ class Listener:
         is_answer, force = False, None
         if self.answer_until:                          # it just asked something (spoken)
             is_answer, force = True, self.answer_model
-        elif self.chat_question and time.time() - self.chat_question[2] < 600:
+        elif (self.chat_question and time.time() - self.chat_question[2] < 300
+              and (YES_RE.match(text) or NO_RE.search(text) or not self.skills.match(text))):
+            # a typed reply after its question answers it, unless it's clearly a new command (a skill)
             is_answer, force = True, self.chat_question[0]
         self.pending = self.early_wake = None          # typing replaces anything half-heard
         self.followup_until = self.answer_until = self.open_until = 0.0
@@ -1694,9 +1702,10 @@ class Listener:
             if m.get("role") == "user":
                 user = m
             elif m.get("role") == "assistant" and user:
-                h = m.get("handler") if m.get("handler") in MODEL_LABEL else "local"
+                h = m.get("handler") if m.get("handler") in MODEL_LABEL or m.get("handler") == "skill" else "local"
                 cmd = user.get("text", "")
                 hist.append({"t": m.get("t", time.time()), "handler": h, "source": user.get("source", "voice"),
+                             "skill": m.get("skill"),
                              "command": f"(answer) {cmd}" if user.get("answer") else cmd,
                              "reply": m.get("text", "")})
                 user = None
@@ -1957,7 +1966,9 @@ class Listener:
             return pointer
         lines = []
         for h in entries:
-            who = "done instantly on the laptop" if h["handler"] == "local" else f"handled by {MODEL_LABEL[h['handler']]}"
+            who = {"local": "done instantly on the laptop",
+                   "skill": f"done instantly by the saved skill '{h.get('skill', '')}'"}.get(
+                h["handler"]) or f"handled by {MODEL_LABEL[h['handler']]}"
             verb = "typed" if h.get("source") == "typed" else "said"
             reply = h["reply"] if len(h["reply"]) <= 600 else h["reply"][:600] + "…"
             lines.append(f"- {time.strftime('%H:%M', time.localtime(h['t']))} user {verb} “{h['command']}” "
@@ -2193,6 +2204,34 @@ class Listener:
         self.reset_vad(keep_noise=True)
         self.on_wake(text[m.end():], time.time())
 
+    def try_skill(self, sk, values):
+        """A saved skill matched. Run it instantly when that's safe; otherwise hand the model a note.
+        -> (note for the model, skill name if it ran, skill to mark verified, reply if it ran)."""
+        where = f"'{sk.name}' (folder {sk.folder})"
+        if sk.blocked:
+            log(f"Skill {sk.name!r} matched but is disabled: {sk.blocked}")
+            return (f"(A saved skill, {where}, matches this command but is disabled: {sk.blocked}. Do the "
+                    "request yourself without running that script.)", None, None, None)
+        cmd = sk.command_line(values, self.skills.python)
+        usual = f"Its usual reply is {sk.reply!r} ({{output}} = what the script prints)."
+        if sk.approval:
+            why = sk.approval_reason or "it is marked as needing approval"
+            log(f"Skill {sk.name!r} needs approval ({why}); the model asks first.")
+            return (f"(A saved skill, {where}, matches this command. It needs the user's approval first ({why}): "
+                    "ask ONE confirmation question that says exactly what it will do, and only after a clear yes "
+                    f"run it with your PowerShell tool: {cmd}  {usual})", None, None, None)
+        if not self.skills.is_verified(sk):
+            log(f"Skill {sk.name!r} is new or changed: its first run goes through the model.")
+            return (f"(A saved skill, {where}, matches this command. It is new or was changed, so run it this once "
+                    f"with your PowerShell tool, exactly: {cmd}  Check it did what the user asked, then reply. {usual} "
+                    "If it fails, fix the script in its folder and say so.)", None, sk, None)
+        ok, out = self.skills.run(sk, values)
+        if ok:
+            return "", sk.name, None, out
+        log(f"Skill {sk.name!r} failed: {out}")
+        return (f"(A saved skill, {where}, was just tried for this command and failed: {out}. Do the request "
+                "yourself, and if fixing the skill's script is simple and safe, fix it too.)", None, None, None)
+
     def note(self, text):
         """A small grey line in the chat (and its log), e.g. 'Stopped.'"""
         self.chatlog.append("note", text)
@@ -2222,12 +2261,27 @@ class Listener:
             shots = shots.get()                       # usually already finished while you were talking
         self.ui.show("think", "Got it", f"“{command}”")
         reply, handler, session = None, "local", None
+        skill_note, skill_name, verify_skill = "", None, None
         if force_model is None:
-            reply = self.local.try_handle(command)
+            hit = None
+            try:
+                hit = self.skills.match(command)       # saved script skills come first...
+            except Exception as e:
+                log(f"Skill matching failed: {e!r}")
+            if hit:
+                skill_note, skill_name, verify_skill, reply = self.try_skill(*hit)
+            else:
+                reply = self.local.try_handle(command)  # ...then the built-in instant actions
         if reply is not None:
-            log(f"COMMAND (local): {command} -> {reply}")
+            if skill_name:
+                handler = "skill"
+                log(f"COMMAND (skill '{skill_name}'): {command} -> {reply}")
+            else:
+                log(f"COMMAND (local): {command} -> {reply}")
         else:
             model, visual = (force_model, False) if force_model else route(command)
+            if skill_note and model == "haiku":       # running / fixing a skill: not a job for Haiku
+                model = "sonnet"
             handler, label = model, MODEL_LABEL[model]
             session = self.sessions[model]
             self.ui.show("think", f"Thinking · {label}", f"“{command}”")
@@ -2237,6 +2291,8 @@ class Listener:
             body = f"(The user's {how} answer to your question:) {command}" if is_answer else command
             if typed:
                 body = TYPED_NOTE + body
+            if skill_note:
+                body += "\n\n" + skill_note
             if visual and shots:
                 listing = "\n".join(f"  - {p}  ({d})" for p, d in shots)
                 body += ("\n\n(Screen context: screenshots of all the user's screens, taken when they spoke:\n"
@@ -2283,14 +2339,16 @@ class Listener:
         # typed prompt + "say it out loud" (or Claude tagged the reply [speak]): read the reply aloud too
         speak_typed = typed and bool(SPEAK_REQ_RE.search(command) or SPEAK_TAG_RE.search(reply))
         text = chat_text(reply)
-        self.history.append({"t": time.time(), "handler": handler, "source": source,
+        if verify_skill is not None and not reply.startswith(("Sorry", "Claude Code isn't")) and "?" not in reply:
+            self.skills.mark_verified(verify_skill)   # its first run went through the model's checked tools
+        self.history.append({"t": time.time(), "handler": handler, "source": source, "skill": skill_name,
                              "command": f"(answer) {command}" if is_answer else command,
                              "reply": text})
         if session is not None:
             session.seen, session.fresh = len(self.history), False
-        self.chatlog.append("assistant", text, handler=handler, source=source)
+        self.chatlog.append("assistant", text, handler=handler, source=source, skill=skill_name)
         self.ui.chat_add({"role": "assistant", "text": text, "handler": handler, "source": source,
-                          "t": time.time()})
+                          "skill": skill_name, "t": time.time()})
 
         spoken, shown, keep, silent = parse_reply(reply)
         ok = not spoken.startswith(("Sorry", "Claude Code isn't"))
@@ -2595,6 +2653,9 @@ def ensure_workspace():
             p = MEMORY_DIR / name
             if not p.exists():
                 p.write_text(text, encoding="utf-8")
+        if not SKILLS_DIR.exists() and SKILL_EXAMPLES.exists():   # starter skills on a fresh copy
+            import shutil
+            shutil.copytree(SKILL_EXAMPLES, SKILLS_DIR)
         target, example = WORKSPACE / "CLAUDE.md", WORKSPACE / "CLAUDE.example.md"
         if not target.exists() and example.exists():
             target.write_text(example.read_text(encoding="utf-8").replace("{HEY_CLAUDE_DIR}", str(HERE)),
