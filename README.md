@@ -81,7 +81,7 @@ reply, then closes again.
 ## Install
 
 ```powershell
-git clone https://github.com/<you>/Hey-Claude.git
+git clone https://github.com/shawnm07/Hey-Claude.git
 cd Hey-Claude
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
