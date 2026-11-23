@@ -33,6 +33,7 @@ Log:   hey-claude.log next to this file
 """
 
 import collections
+import contextlib
 import ctypes
 import ctypes.wintypes as wt
 import difflib
@@ -118,7 +119,9 @@ DEFAULT_SETTINGS = {
     "answer_window_seconds": 8,
     "pause_allowed_seconds": 1.4,
     "listen_after_reply_seconds": 3,
+    "chat_hud": True,              # false = the old status pill only (no chat window); read at startup
 }
+CONV_DIR = WORKSPACE / "conversations"   # one .jsonl log per conversation (append-only, never deleted)
 
 
 class Settings:
@@ -164,6 +167,8 @@ class Settings:
         num("voice_speed", 0.7, 1.6); num("hud_seconds_after_reply", 3, 120)
         num("answer_window_seconds", 3, 30); num("pause_allowed_seconds", 0.8, 4.0)
         num("listen_after_reply_seconds", 0, 10)
+        if isinstance(raw.get("chat_hud"), bool):
+            d["chat_hud"] = raw["chat_hud"]
         old, self.data = self.data, d
         if old != d:
             log(f"Settings loaded: {json.dumps(d)}")
@@ -222,15 +227,27 @@ NO_RE = re.compile(r"\b(?:no|nope|don't|do not|not|wait|stop|cancel|hold on|neve
 
 REFLECT_PROMPT = (
     "[Automatic wrap-up, not from the user. Nothing you say here is spoken.] "
-    "This voice conversation has ended. Review the commands in it and update memory/learned.md (Edit tool) "
+    "This conversation (spoken and typed) has ended. Review the commands in it and update memory/learned.md (Edit tool) "
     "with anything that will make future voice commands faster or more accurate. Always save: (1) anything the "
     "user had to clarify, correct or repeat, as 'when the user says X they mean Y'; (2) which app, list, device, "
     "script or file a vague phrase turned out to mean; (3) a quicker way to do something that took several "
     "steps or failed first; (4) preferences shown by how they reacted. Merge with what's already there, keep it "
     "under 40 short bullets, and remove anything outdated or contradicted. Skip things already in "
     "memory/permanent.md or memory/about-user.md, one-off details, passwords, and private content from "
-    "screenshots. Never edit memory/permanent.md or memory/about-user.md. Reply with just 'updated' or 'no change'."
+    "screenshots. Only add what isn't already noted in your memory files; if nothing new was learned, change "
+    "nothing. Never edit memory/permanent.md or memory/about-user.md. Reply with just 'updated' or 'no change'."
 )
+# Hey Claude was stopped (restart, sign-out, crash) before an earlier conversation's sessions could review it
+CATCHUP_HEAD = (
+    "[Automatic wrap-up, not from the user.] Hey Claude was restarted before it could review an earlier "
+    "conversation, so here is its transcript instead:\n\n"
+)
+TYPED_NOTE = (
+    "(Typed in the chat window, not spoken. Your reply is shown there as text and is NOT read aloud, so it can "
+    "be longer than a spoken reply when that helps, and may use simple formatting: short paragraphs, '-' "
+    "bullets, **bold**, `code`. It is always meant for you: never reply [ignore].)\n"
+)
+STOPPED = "\x00stopped"          # ClaudeSession.ask() result when the user pressed Stop
 
 # ---- model routing (first match wins; instant local actions are tried before this)
 OPUS_RE = re.compile(
@@ -672,14 +689,15 @@ class ScreenGrab:
     """Screenshots of every monitor: pixels grabbed immediately (so the pill isn't in them),
     PNGs written on a background thread. get() waits for the files: [(path, description)]."""
 
-    def __init__(self):
+    def __init__(self, fg=None):
+        """fg: the window the user was using (when they typed in the chat, it isn't the foreground one)."""
         self.shots, self.error = [], None
         grabbed = []
         try:
             SCREEN_DIR.mkdir(parents=True, exist_ok=True)
             for old in SCREEN_DIR.glob("*.png"):
                 old.unlink(missing_ok=True)
-            active = user32.MonitorFromWindow(user32.GetForegroundWindow(), 2)
+            active = user32.MonitorFromWindow(fg or user32.GetForegroundWindow(), 2)
             mons = sorted(all_monitors(), key=lambda m: (m[0] != active, not m[2]))
             for i, (hmon, r, primary) in enumerate(mons, 1):
                 tags = [f"{r.right - r.left}x{r.bottom - r.top}"]
@@ -804,8 +822,20 @@ class Overlay:
         self._activity_baseline()
         self.root.after(40, self._tick)
 
+    # The chat HUD's extra API (hud.py), as no-ops: this pill is the fallback when chat_hud is off.
+    prev_fg, mic_level, chat_open, visible = None, 0.0, False, False
+
+    def chat_add(self, msg): pass
+    def chat_reset(self, manual=False): pass
+    def speaking(self, on): pass
+    def mic_state(self, reason): pass
+    def toast(self, text, seconds=2.4): pass
+
+    def capture_hidden(self):
+        return contextlib.nullcontext()
+
     # thread-safe API
-    def show(self, state, title, detail="", hide_after=None):
+    def show(self, state, title, detail="", hide_after=None, kind=None):
         self.q.put(("show", state, title, detail, hide_after))
 
     def hide(self):
@@ -1185,7 +1215,9 @@ class ClaudeSession:
                 pass
         self.p = None
 
-    def ask(self, text: str, progress=lambda d: None) -> str:
+    def ask(self, text: str, progress=lambda d: None, stop=None) -> str:
+        """stop: a threading.Event; when set (Stop in the chat), the request is abandoned and this
+        session restarts fresh (it then gets the conversation so far as context). Returns STOPPED."""
         if not self.alive():
             self.start()
         self.turns += 1
@@ -1193,12 +1225,17 @@ class ClaudeSession:
             self.p.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n")
             self.p.stdin.flush()
         except OSError:
-            self.start(); return self.ask(text, progress)
+            self.start(); return self.ask(text, progress, stop)
         deadline = time.time() + CLAUDE_TIMEOUT_S
         while True:
+            if stop is not None and stop.is_set():
+                log("  stopped by the user"); self.start()
+                return STOPPED
             try:
-                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                line = self.lines.get(timeout=max(0.05, min(0.25, deadline - time.time())))
             except queue.Empty:
+                if time.time() < deadline:
+                    continue
                 log("  timed out"); self.start()
                 return "Sorry, that took too long."
             if line is None:
@@ -1252,6 +1289,13 @@ def parse_reply(reply: str):
     if silent and (keep or "?" in spoken):            # something to read or answer is never silent
         silent = False
     return spoken, pill, keep, silent
+
+
+def chat_text(reply: str) -> str:
+    """The reply as shown in the chat window: display markers removed, formatting kept."""
+    r = re.sub(r"[ \t]*\[(?:silent|keep|ignore)\][ \t]*", " ", reply or "", flags=re.I)
+    r = re.sub(r"[ \t]*\[screen\][ \t]*", "\n\n", r, flags=re.I)
+    return re.sub(r"[ \t]{2,}", " ", r).strip()
 
 
 TRIAGE_DIR = HERE / "triage"
@@ -1486,15 +1530,23 @@ class LocalActions:
 # ================================================================= listener
 
 class Listener:
-    def __init__(self, model, voice: Voice, overlay: Overlay, fast_model=None):
+    def __init__(self, model, voice: Voice, overlay: Overlay, fast_model=None, chatlog=None):
+        from chatlog import ChatLog
         self.model, self.voice, self.ui = model, voice, overlay
         self.fast_model = fast_model or model         # spots the wake word; `model` transcribes commands
         self.local = LocalActions()
         self.sessions = {m: ClaudeSession(m) for m in ("haiku", "sonnet", "opus")}
         for m in ("haiku", "sonnet"):                 # pre-start (no cost until used); opus starts on demand
             self.sessions[m].start()
-        self.history: list = []                       # shared 15-minute conversation: t, handler, command, reply
-        self.last_activity = 0.0
+        # The conversation (until 15 quiet minutes): saved in workspace/conversations/, and picked up
+        # again after a restart, so the context survives it.
+        self.chatlog = chatlog or ChatLog(CONV_DIR, CONTEXT_WINDOW_S, log)
+        self.history: list = self.history_from_log()  # t, handler, command, reply, source
+        self.last_activity = self.history[-1]["t"] if self.history else 0.0
+        self.stop_event = threading.Event()           # Stop pressed in the chat
+        self.chat_question = None                      # (model, question, time): a typed reply answers it
+        self.manual_listen = False                     # listening because of F20 / the mic button
+        self.wake_on, self.demand_until, self.mic_reason = True, 0.0, "starting"
         self.reflect_lock = threading.Lock()
         self.q: "queue.Queue[np.ndarray]" = queue.Queue()
         self.stream, self.last_audio = None, 0.0
@@ -1514,10 +1566,168 @@ class Listener:
         self.wake_at, self.wake_judged = 0.0, False    # false-wake check ~4 s after "Hey Claude"
         self.triage = TriageSession().start()          # "was that meant for me?" (no tools, ~1 s)
         try:
-            self.ui.on_action = self.ctrl.put
+            self.ui.on_action = self._ui_action
         except Exception:
             pass
         self.reset_vad()
+        threading.Thread(target=self._catch_up_reflections, daemon=True).start()
+
+    # ---- the chat window / pill / F20 (actions arrive from the Tk thread)
+    def _ui_action(self, action):
+        if action == "stop":                           # must work while a request is running
+            self.stop_event.set()
+            self.ctrl.put("hush")
+            return
+        self.ctrl.put(action)
+
+    def handle_ui_actions(self):
+        while True:
+            try:
+                action = self.ctrl.get_nowait()
+            except queue.Empty:
+                return
+            kind = action[0] if isinstance(action, tuple) else action
+            try:
+                if kind == "send":
+                    self.run_typed(action[1])
+                elif kind == "new":
+                    self.new_conversation()
+                elif kind == "hush":
+                    self.hush()
+                elif kind == "mic":
+                    self.listen_now()
+                elif self.speaking:
+                    pass                               # ✓ / ✕ only act while listening
+                elif kind == "finish":
+                    self.finish_now()
+                elif kind == "cancel":
+                    self.cancel_listening()
+            except Exception as e:
+                log(f"UI action {kind!r} failed: {e!r}")
+                self.ui.show("error", "Something went wrong", str(e)[:120], hide_after=6)
+
+    def grab(self, fg=None):
+        """Screenshots of every monitor, without the HUD in them."""
+        with self.ui.capture_hidden():
+            return ScreenGrab(fg=fg)
+
+    def run_typed(self, text):
+        text = (text or "").strip()
+        if not text:
+            return
+        if self.speaking:
+            self.hush()
+        is_answer, force = False, None
+        if self.answer_until:                          # it just asked something (spoken)
+            is_answer, force = True, self.answer_model
+        elif self.chat_question and time.time() - self.chat_question[2] < 600:
+            is_answer, force = True, self.chat_question[0]
+        self.pending = self.early_wake = None          # typing replaces anything half-heard
+        self.followup_until = self.answer_until = self.open_until = 0.0
+        self.wake_at, self.wake_judged, self.manual_listen = 0.0, False, False
+        self.reset_vad(keep_noise=True)
+        log(f"Typed: {text!r}")
+        self.execute(text, time.time(), shots=self.grab(fg=self.ui.prev_fg), force_model=force,
+                     is_answer=is_answer, source="typed")
+
+    def hush(self):
+        """Stop talking now (Stop button / Stop speaking)."""
+        if not self.speaking:
+            return
+        log("Stopped speaking (button).")
+        self.voice.stop()
+        self.speaking, self.after_speech = False, None
+        self.reset_vad(keep_noise=True)
+        self.voice.cool()
+        self.ui.speaking(False)
+        self.ui.linger(max(3.0, settings()["hud_seconds_after_reply"]))
+
+    def listen_now(self):
+        """F20 held / mic button: listen as if "Hey Claude" was said. Works on battery too
+        (the mic opens just for this); not while the screen is locked or off."""
+        why = self.why_not_listening() if hasattr(self, "screen") else "starting"
+        if why and why != "on battery":
+            self.ui.toast(f"Can't listen right now ({why}).")
+            return
+        if self.speaking:
+            self.hush()
+        if self.pending:
+            return                                     # already collecting a command
+        self.demand_until = time.time() + FOLLOWUP_S + 3
+        if self.stream is None:
+            try:
+                self.open()
+            except Exception as e:
+                log(f"Couldn't open mic for push-to-talk: {e!r}")
+                self.ui.toast("Couldn't open the microphone.")
+                return
+        self.early_wake = None
+        self.answer_until = self.open_until = 0.0
+        self.reset_vad(keep_noise=True)
+        self.manual_listen = True
+        log("Listening on request (F20 / mic button).")
+        self.on_wake("", time.time())
+        self.wake_judged = True                        # you asked for it: no false-wake check
+
+    def new_conversation(self):
+        if self.speaking:
+            self.hush()
+        self.pending = self.early_wake = None
+        self.followup_until = self.answer_until = self.open_until = 0.0
+        self.end_conversation("new conversation button", manual=True)
+
+    def history_from_log(self):
+        hist, user = [], None
+        for m in self.chatlog.messages():
+            if m.get("role") == "user":
+                user = m
+            elif m.get("role") == "assistant" and user:
+                h = m.get("handler") if m.get("handler") in MODEL_LABEL else "local"
+                cmd = user.get("text", "")
+                hist.append({"t": m.get("t", time.time()), "handler": h, "source": user.get("source", "voice"),
+                             "command": f"(answer) {cmd}" if user.get("answer") else cmd,
+                             "reply": m.get("text", "")})
+                user = None
+        if hist:
+            log(f"Continuing the conversation in {self.chatlog.path.name} ({len(hist)} exchanges).")
+        return hist
+
+    def _catch_up_reflections(self):
+        """Conversations that ended while Hey Claude wasn't running never got their learned-memory
+        review; do it now from the saved transcript (oldest first, the last few only)."""
+        try:
+            files = [f for f in self.chatlog.files() if f != self.chatlog.path][-3:]
+            for f in files:
+                if time.time() - f.stat().st_mtime < 3 * 86400:
+                    self._catch_up(f)
+        except Exception as e:
+            log(f"Learned-memory catch-up failed: {e!r}")
+
+    def _catch_up(self, path):
+        from chatlog import ChatLog
+        msgs = ChatLog.read(path)
+        todo = msgs[self.chatlog.reflected_upto(path):]
+        if not todo:
+            return
+        if not any(m.get("role") == "assistant" and m.get("handler") in MODEL_LABEL for m in todo):
+            self.chatlog.mark_reflected(path, len(msgs))  # instant actions only: nothing to learn
+            return
+        lines = []
+        for m in todo:
+            who = {"user": "User", "assistant": "Assistant"}.get(m.get("role"), "Note")
+            how = f" ({m['source']})" if m.get("role") == "user" and m.get("source") else ""
+            lines.append(f"{who}{how}: {str(m.get('text', ''))[:1500]}")
+        transcript = "\n".join(lines)[-20000:]
+        model = settings()["models"]["normal"]
+        with self.reflect_lock:
+            s = ClaudeSession(model).start()
+            try:
+                result = s.ask(CATCHUP_HEAD + transcript + "\n\n" + REFLECT_PROMPT)
+            finally:
+                s.stop()
+        log(f"Learned-memory catch-up ({path.name}, {model}): {result}")
+        if not result.startswith(("Sorry", "Claude Code isn't")):
+            self.chatlog.mark_reflected(path, len(msgs))
 
     # ---- ✓ / ✕ on the pill
     def finish_now(self):
@@ -1540,6 +1750,7 @@ class Listener:
         """✕: drop the command (or the answer to its question) and stop listening."""
         if not quiet:
             log("✕ clicked: cancelled.")
+        self.manual_listen = False
         self.pending, self.early_wake = None, None
         self.followup_until = self.answer_until = self.open_until = 0.0
         self.wake_at, self.wake_judged = 0.0, False
@@ -1560,7 +1771,12 @@ class Listener:
 
     # ---- audio
     def _callback(self, indata, frames, t, status):
-        self.q.put(indata[:, 0].copy())
+        frame = indata[:, 0].copy()
+        self.q.put(frame)
+        try:
+            self.ui.mic_level = float(np.sqrt(np.mean(frame * frame)))   # the chat's listening bars
+        except Exception:
+            pass
 
     def open(self):
         self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=FRAME,
@@ -1667,6 +1883,7 @@ class Listener:
 
     def false_wake(self, reason, text=""):
         log(f"False wake ignored ({reason}): {text[:120]!r}")
+        self.manual_listen = False
         self.voice.cool()
         self.pending, self.early_wake = None, None
         self.followup_until = self.answer_until = self.open_until = 0.0
@@ -1711,52 +1928,80 @@ class Listener:
 
     # ---- shared conversation context
     def context_preface(self, s: ClaudeSession) -> str:
-        """Recent commands this session didn't handle itself (other models, instant actions),
-        or the whole last 15 minutes if the session is brand new."""
-        cutoff = time.time() - CONTEXT_WINDOW_S
+        """Commands in this conversation that this session didn't handle itself (other models,
+        instant actions), or the whole conversation so far if the session is brand new. A brand-new
+        session also learns where the previous conversation is saved."""
         if s.fresh:
-            entries = [h for h in self.history if h["t"] >= cutoff]
+            entries = self.history[-40:]
         else:
-            entries = [h for h in self.history[s.seen:] if h["handler"] != s.model and h["t"] >= cutoff]
+            entries = [h for h in self.history[s.seen:] if h["handler"] != s.model]
+        pointer = ""
+        if s.fresh:
+            prev = self.chatlog.previous()
+            if prev is not None:
+                pointer = (f"(The previous conversation is saved at {prev} (JSON lines). Read it only if the "
+                           "user refers to something from before this conversation.)\n\n")
         if not entries:
-            return ""
+            return pointer
         lines = []
         for h in entries:
             who = "done instantly on the laptop" if h["handler"] == "local" else f"handled by {MODEL_LABEL[h['handler']]}"
-            lines.append(f"- {time.strftime('%H:%M', time.localtime(h['t']))} user said “{h['command']}” "
-                         f"→ “{h['reply']}” ({who})")
-        return ("(Earlier in this voice conversation — use it to understand words like 'it', 'that', "
-                "'again', 'undo':\n" + "\n".join(lines) + ")\n\n")
+            verb = "typed" if h.get("source") == "typed" else "said"
+            reply = h["reply"] if len(h["reply"]) <= 600 else h["reply"][:600] + "…"
+            lines.append(f"- {time.strftime('%H:%M', time.localtime(h['t']))} user {verb} “{h['command']}” "
+                         f"→ “{reply}” ({who})")
+        return pointer + ("(Earlier in this conversation — use it to understand words like 'it', 'that', "
+                          "'again', 'undo':\n" + "\n".join(lines) + ")\n\n")
 
-    def rotate(self, model, why):
-        """Swap in a fresh session for `model`; the old one writes what it learned, then exits."""
+    def rotate(self, model, why, mark=None):
+        """Swap in a fresh session for `model`; the old one writes what it learned, then exits.
+        mark=(conversation file, n): record that file as reviewed once the review succeeds."""
         old = self.sessions[model]
         new = ClaudeSession(model)
         if model != "opus" or old.alive():
             new.start()
         self.sessions[model] = new
         if old.turns > 0 and old.alive():
-            threading.Thread(target=self._reflect_and_stop, args=(old, why), daemon=True).start()
+            threading.Thread(target=self._reflect_and_stop, args=(old, why, mark), daemon=True).start()
         else:
             old.stop()
 
-    def _reflect_and_stop(self, old: ClaudeSession, why):
+    def _reflect_and_stop(self, old: ClaudeSession, why, mark=None):
         with self.reflect_lock:                        # one writer of learned.md at a time
             try:
                 result = old.ask(REFLECT_PROMPT)
                 log(f"Learned-memory review ({old.model}, {why}): {result}")
+                if mark and not result.startswith(("Sorry", "Claude Code isn't")):
+                    self.chatlog.mark_reflected(*mark)
             except Exception as e:
                 log(f"Learned-memory review failed: {e!r}")
             finally:
                 old.stop()
 
-    def end_conversation(self, why):
+    def end_conversation(self, why, manual=False):
+        """Close this conversation: every session that took part reviews it for learned memory
+        (memories, preferences and settings carry over), and the next message starts a new log."""
         log(f"Conversation ended ({why}); starting fresh.")
-        self.history = []
-        self.local.last_opened = None
+        conv = self.chatlog.path
+        upto = len(self.chatlog.messages()) if conv else 0
+        reviewing = False
         for m, s in list(self.sessions.items()):
             if s.turns > 0:
-                self.rotate(m, why)
+                reviewing = True
+                self.rotate(m, why, mark=(conv, upto) if conv else None)
+        if conv and not reviewing:                     # e.g. everything happened before a restart
+            threading.Thread(target=lambda: self._safe_catch_up(conv), daemon=True).start()
+        self.chatlog.new()
+        self.history = []
+        self.local.last_opened = None
+        self.chat_question = None
+        self.ui.chat_reset(manual)
+
+    def _safe_catch_up(self, path):
+        try:
+            self._catch_up(path)
+        except Exception as e:
+            log(f"Learned-memory catch-up failed: {e!r}")
 
     # ---- collecting a command (it keeps going as long as you keep talking)
     def begin_pending(self, text, t0, shots=None, force_model=None, is_answer=False, kind="wake"):
@@ -1764,7 +2009,8 @@ class Listener:
                         "force_model": force_model, "is_answer": is_answer,
                         "voice": self.last_voice,      # your voice, to spot roommates joining in
                         "kind": "answer" if is_answer else kind,
-                        "asr": [self.last_asr], "snr": [self.speech_snr(self.last_voice)], "checked": False}
+                        "asr": [self.last_asr], "snr": [self.speech_snr(self.last_voice)],
+                        "checked": self.manual_listen}  # F20 / mic button: you asked for it, no filter
         self.pending_deadline = time.time() + continue_s()
         if not self.wake_at:
             self.wake_at = time.time()
@@ -1773,6 +2019,7 @@ class Listener:
     def run_pending(self):
         p, self.pending = self.pending, None
         self.wake_at, self.wake_judged = 0.0, False
+        self.manual_listen = False
         text = p["text"].strip(" ,.!?")
         if not text:
             self.ui.hide(); return
@@ -1786,8 +2033,8 @@ class Listener:
     def check_early_wake(self):
         """Called while you're still talking: if the start of what you've said so far is
         'Hey Claude', chime and show 'Listening…' immediately instead of waiting for you to finish."""
-        if (self.early_wake is not None or self.early_i >= len(EARLY_WAKE_AT_S) or self.pending
-                or self.answer_until or self.followup_until or self.open_until):
+        if (not self.wake_on or self.early_wake is not None or self.early_i >= len(EARLY_WAKE_AT_S)
+                or self.pending or self.answer_until or self.followup_until or self.open_until):
             return
         if len(self.buf) * FRAME_S < EARLY_WAKE_AT_S[self.early_i]:
             return
@@ -1796,7 +2043,7 @@ class Listener:
         if self.speech_snr(voice_features(head)) < EARLY_WAKE_MIN_SNR_DB:
             return                                    # too faint to be someone at the laptop
         if self.spot_wake(head, at_start=True):
-            shots = ScreenGrab()                      # pixels grabbed before the pill appears; PNGs in background
+            shots = self.grab()                      # pixels grabbed before the pill appears; PNGs in background
             self.ui.show("listen", "Listening…", "")  # visual cue now; the chime waits for small.en to confirm
             self.early_wake = {"shots": shots}
             self.wake_at, self.wake_judged = time.time(), False
@@ -1806,7 +2053,7 @@ class Listener:
         """'Hey Claude' heard (normally, or over its own voice). after_wake = whatever followed it.
         shots given = the chime/pill/screenshots already happened (early detection)."""
         if shots is None:
-            shots = ScreenGrab()                      # pixels grabbed before the pill appears; PNGs in background
+            shots = self.grab()                      # pixels grabbed before the pill appears; PNGs in background
             chime()
             self.voice.warm(20)                       # wake the Bluetooth speaker for the reply
             self.wake_at, self.wake_judged = time.time(), False
@@ -1873,7 +2120,7 @@ class Listener:
                 self.close_open_window()
                 return
             log(f"Open-mic follow-up (no wake word): {text!r}")
-            self.begin_pending(text, t0, shots=ScreenGrab(), kind="open")
+            self.begin_pending(text, t0, shots=self.grab(), kind="open")
             return
 
         # 3) the command after a bare "Hey Claude"
@@ -1899,7 +2146,9 @@ class Listener:
             self.on_wake(text[m.end():], t0, shots=ew["shots"])
             return
 
-        # 4) normal: is this "Hey Claude ..."?
+        # 4) normal: is this "Hey Claude ..."? (not on battery: there the mic only opens for F20)
+        if not self.wake_on:
+            return
         if len(audio) / RATE <= SINGLE_PASS_S:
             text = self.transcribe(audio)
         else:
@@ -1926,14 +2175,29 @@ class Listener:
         log(f"Interrupted by wake word: {text!r}")
         self.voice.stop()
         self.speaking, self.after_speech = False, None
+        self.ui.speaking(False)
         self.barge_ring.clear()
         self.last_voice = None                         # mixed with its own voice: no reliable fingerprint
         self.reset_vad(keep_noise=True)
         self.on_wake(text[m.end():], time.time())
 
-    def execute(self, command, t0, shots=None, force_model=None, is_answer=False):
+    def note(self, text):
+        """A small grey line in the chat (and its log), e.g. 'Stopped.'"""
+        self.chatlog.append("note", text)
+        self.ui.chat_add({"role": "note", "text": text, "t": time.time()})
+
+    def execute(self, command, t0, shots=None, force_model=None, is_answer=False, source="voice"):
+        """Run one command (spoken or typed) and show / speak the reply. Typed: the reply is text only."""
+        typed = source == "typed"
         self.last_activity = time.time()
-        # Approval lock: only a clear spoken "yes" to its question unlocks ONE send (see approval_gate.py).
+        self.stop_event.clear()
+        self.chat_question = None
+        # the chat window already shows what you typed; spoken commands are added here
+        self.chatlog.append("user", command, source=source, answer=is_answer or None)
+        if not typed:
+            self.ui.chat_add({"role": "user", "text": command, "source": "voice", "t": time.time()})
+        # Approval lock: only a clear "yes" (spoken, or typed in the chat) to its question unlocks ONE
+        # send (see approval_gate.py).
         try:
             if is_answer and YES_RE.match(command) and not NO_RE.search(command):
                 APPROVAL_TOKEN.write_text(f"{time.time()}\n{self.spoken_reply}\n", encoding="utf-8")
@@ -1955,8 +2219,12 @@ class Listener:
             handler, label = model, MODEL_LABEL[model]
             session = self.sessions[model]
             self.ui.show("think", f"Thinking · {label}", f"“{command}”")
-            self.voice.warm(180)                       # speaker stays awake while Claude works
-            body = f"(The user's spoken answer to your question:) {command}" if is_answer else command
+            if not typed:
+                self.voice.warm(180)                   # speaker stays awake while Claude works
+            how = "typed" if typed else "spoken"
+            body = f"(The user's {how} answer to your question:) {command}" if is_answer else command
+            if typed:
+                body = TYPED_NOTE + body
             if visual and shots:
                 listing = "\n".join(f"  - {p}  ({d})" for p, d in shots)
                 body += ("\n\n(Screen context: screenshots of all the user's screens, taken when they spoke:\n"
@@ -1966,37 +2234,70 @@ class Listener:
             log(f"COMMAND ({model}{', answer' if is_answer else ''}"
                 f"{f', +{len(shots)} screens' if visual and shots else ''}): {command}")
             allow_foreground()
-            reply = session.ask(prompt, lambda d: self.ui.show("act", f"Working · {label}", d))
+            progress = lambda d: self.ui.show("act", f"Working · {label}", d)
+            reply = session.ask(prompt, progress, stop=self.stop_event)
             log(f"  REPLY ({time.time() - t0:.1f}s): {reply}")
-            if model == "haiku" and not is_answer and CANT_RE.search(reply):
+            if reply != STOPPED and model == "haiku" and not is_answer and CANT_RE.search(reply):
                 # Haiku has no connectors; if it says it can't reach something, let Sonnet try.
                 session.seen, session.fresh = len(self.history), False
                 handler, label, session = "sonnet", MODEL_LABEL["sonnet"], self.sessions["sonnet"]
                 log("  Haiku couldn't do it; retrying with Sonnet.")
                 self.ui.show("think", f"Thinking · {label}", f"“{command}”")
                 reply = session.ask(self.context_preface(session) + body,
-                                    lambda d: self.ui.show("act", f"Working · {label}", d))
+                                    lambda d: self.ui.show("act", f"Working · {label}", d), stop=self.stop_event)
                 log(f"  REPLY ({time.time() - t0:.1f}s, Sonnet): {reply}")
 
-        if session is not None and re.search(r"\[ignore\]", reply, re.I):
-            # Claude decided it wasn't meant for it (background talk / gibberish): no response at all
-            log("  Claude marked it [ignore]: no response.")
-            session.seen, session.fresh = len(self.history), False
+        if reply == STOPPED:                           # Stop pressed: that session restarted fresh
+            self.history.append({"t": time.time(), "handler": handler, "source": source,
+                                 "command": command, "reply": "(stopped by the user before replying)"})
+            self.note("Stopped.")
             self.flush()
             self.voice.cool()
             self.ui.hide()
+            self.stop_event.clear()
             return
-        self.history.append({"t": time.time(), "handler": handler,
+        if session is not None and re.search(r"\[ignore\]", reply, re.I):
+            if typed:                                  # typed is always meant for it
+                reply = chat_text(reply) or "Okay."
+            else:
+                # Claude decided it wasn't meant for it (background talk / gibberish): no response at all
+                log("  Claude marked it [ignore]: no response.")
+                session.seen, session.fresh = len(self.history), False
+                self.note("Ignored: that didn't sound like it was meant for me.")
+                self.flush()
+                self.voice.cool()
+                self.ui.hide()
+                return
+        text = chat_text(reply)
+        self.history.append({"t": time.time(), "handler": handler, "source": source,
                              "command": f"(answer) {command}" if is_answer else command,
-                             "reply": parse_reply(reply)[1]})
+                             "reply": text})
         if session is not None:
             session.seen, session.fresh = len(self.history), False
+        self.chatlog.append("assistant", text, handler=handler, source=source)
+        self.ui.chat_add({"role": "assistant", "text": text, "handler": handler, "source": source,
+                          "t": time.time()})
 
         spoken, shown, keep, silent = parse_reply(reply)
         ok = not spoken.startswith(("Sorry", "Claude Code isn't"))
         # Any question in the reply opens the answer window ("Delete these 2 files? Say yes to go ahead.")
         asked = session is not None and ok and "?" in spoken
+        if asked:
+            self.chat_question = (handler, spoken, time.time())   # a typed reply in the chat answers it
+        self.spoken_reply = spoken
         self.flush()                                   # drop whatever the mic heard while it was thinking
+        if typed:                                      # text only: no voice, no open mic
+            self.voice.cool()
+            if silent and ok:
+                self.ui.show("done", "Done", shown, hide_after=2.5)
+            else:
+                self.ui.show("ask" if asked else ("done" if ok else "error"),
+                             "Question" if asked else ("Done" if ok else "Couldn't do that"), shown)
+                self.ui.linger(None if keep or asked else settings()["hud_seconds_after_reply"])
+            self.last_activity = time.time()
+            if session is not None and session.turns >= MAX_TURNS:
+                self.rotate(handler, f"{MAX_TURNS} commands")
+            return
         if silent and ok:                              # simple, self-evident action: no voice, brief pill
             self.voice.cool()
             self.ui.show("done", "Done", shown, hide_after=2.5)
@@ -2010,10 +2311,10 @@ class Listener:
             self.ui.show("done" if ok else "error", "Done" if ok else "Couldn't do that", shown)
         # Talk in the background: the main loop keeps running so "Hey Claude" can interrupt.
         # The pill stays up until the voice finishes (see finish_speaking), then lingers.
-        self.spoken_reply = spoken
         self.after_speech = ("ask", handler, shown) if asked else ("done", keep, shown)
         self.barge_ring.clear(); self.barge_next = time.time() + BARGE_EVERY_S
         self.speaking = True
+        self.ui.speaking(True)
         self.voice.speak(spoken)
         self.last_activity = time.time()
         if session is not None and session.turns >= MAX_TURNS:
@@ -2022,12 +2323,13 @@ class Listener:
     def finish_speaking(self):
         """Called once the voice has finished on its own."""
         self.speaking = False
+        self.ui.speaking(False)
         self.reset_vad(keep_noise=True)                # throw away the tail of our own voice
         kind, extra, shown = self.after_speech or ("done", False, "")
         self.after_speech = None
         if kind == "ask":
             self.answer_until, self.answer_model = time.time() + settings()["answer_window_seconds"], extra
-            self.ui.show("listen", "Listening for your answer…", shown)
+            self.ui.show("listen", "Listening for your answer…", shown, kind="answer")
             log("Asked a question; listening for the answer.")
         else:
             window = settings()["listen_after_reply_seconds"]
@@ -2035,7 +2337,7 @@ class Listener:
             if window > 0:
                 # Open mic: talk within a few seconds and it's taken as a command, no wake word.
                 self.open_until = time.time() + window
-                self.ui.show("listen", "Listening…", shown)
+                self.ui.show("listen", "Listening…", shown, kind="open")
             else:
                 self.close_open_window()
         self.last_activity = time.time()
@@ -2072,16 +2374,46 @@ class Listener:
             return "display off"
         return None
 
+    def on_demand_active(self) -> bool:
+        """On battery the mic opens only for F20 / the mic button: until that command, its reply
+        and the follow-up windows after it are over."""
+        return bool(time.time() < self.demand_until or self.pending is not None or self.followup_until
+                    or self.answer_until or self.open_until or self.speaking or self.in_speech)
+
+    def housekeeping(self):
+        """Things that happen whether or not the mic is open (chat, F20, settings, idle end)."""
+        now = time.time()
+        self.handle_ui_actions()                       # ✓ / ✕, typed prompts, Stop, F20, new conversation
+        if self.speaking and not self.voice.is_speaking():
+            self.finish_speaking()
+        if now >= self.settings_check:
+            self.settings_check = now + 1.0
+            self.apply_settings()
+        if self.history and not self.speaking and now - self.last_activity > CONTEXT_WINDOW_S:
+            self.end_conversation("15 minutes idle")
+
     def run(self):
         self.screen, self.lock_poll = ScreenWatcher(), 0.0
         while True:
-            why = self.why_not_listening()
+            reason = self.why_not_listening()
+            self.wake_on = reason is None              # the wake word itself: only plugged in / docked
+            why = None if (reason == "on battery" and self.on_demand_active()) else reason
+            if reason != self.mic_reason:
+                self.mic_reason = reason
+                self.ui.mic_state(reason)
             if why:
-                if self.stream is not None:
+                if self.stream is not None and why != "on battery":
                     self.pending = self.early_wake = None
                     self.followup_until = self.answer_until = self.open_until = 0.0
+                    self.manual_listen = False
                     self.ui.hide()
-                self.close(why); time.sleep(1); continue
+                self.close(why)
+                for _ in range(5):                     # stay responsive to the chat window and F20
+                    self.housekeeping()
+                    if self.stream is not None:        # F20 opened the mic
+                        break
+                    time.sleep(0.2)
+                continue
             if self.stream is None:
                 try:
                     self.open()
@@ -2090,22 +2422,7 @@ class Listener:
             power_check = time.time() + 1                 # re-check battery / lock / display every second
             while time.time() < power_check:
                 now = time.time()
-                while not self.ctrl.empty():                  # ✓ / ✕ clicked on the pill
-                    action = self.ctrl.get_nowait()
-                    try:
-                        if self.speaking:
-                            pass                              # buttons only act while listening
-                        elif action == "finish":
-                            self.finish_now()
-                        elif action == "cancel":
-                            self.cancel_listening()
-                    except Exception as e:
-                        log(f"Button action failed: {e!r}")
-                if self.speaking and not self.voice.is_speaking():
-                    self.finish_speaking()
-                if now >= self.settings_check:
-                    self.settings_check = now + 1.0
-                    self.apply_settings()
+                self.housekeeping()
                 # False-wake check ~4 s after "Hey Claude" (or after someone starts talking in the
                 # open-mic window): if it's noise, gibberish or roommates, cancel silently right then.
                 if self.open_until and self.in_speech and not self.wake_at and self.utter_start <= self.open_until:
@@ -2131,8 +2448,6 @@ class Listener:
                         self.answer_until = 0.0; self.ui.hide()
                     if self.open_until and now > self.open_until:             # nothing said after the reply
                         self.close_open_window()
-                if self.history and not self.speaking and now - self.last_activity > CONTEXT_WINDOW_S:
-                    self.end_conversation("15 minutes idle")
                 try:
                     frame = self.q.get(timeout=0.3)
                 except queue.Empty:
@@ -2143,7 +2458,8 @@ class Listener:
 
                 if self.speaking:                      # only listen for "Hey Claude" while talking
                     self.barge_ring.append(frame)
-                    if time.time() >= self.barge_next and len(self.barge_ring) >= int(1.2 / FRAME_S):
+                    if (self.wake_on and time.time() >= self.barge_next
+                            and len(self.barge_ring) >= int(1.2 / FRAME_S)):
                         self.barge_next = time.time() + BARGE_EVERY_S
                         try:
                             self.check_barge_in()
@@ -2226,7 +2542,38 @@ def load_fast_whisper():
         return None
 
 
+MEMORY_STUBS = {
+    "permanent.md": "# Permanent memory (things the user told you to remember)\n\nOnly change this file when the "
+                    "user explicitly asks (\"add X to your memory\", \"remember that X\", \"forget X\"). One short "
+                    "bullet per fact, newest last, with the date added.\n\n",
+    "learned.md": "# Learned memory (updated automatically after each conversation)\n\nWhat the user means by "
+                  "things, which apps/lists/devices they mean, quicker ways to do common requests, and mistakes "
+                  "to avoid. Keep under 40 short bullets.\n\n",
+    "about-user.md": "# About the user\n\n(Write a short profile here: who you are, what you do, how you like "
+                     "answers. Hey Claude reads it only when a request is about you.)\n",
+}
+
+
+def ensure_workspace():
+    """First run on a fresh copy: create the private files that are never published
+    (workspace/CLAUDE.md from the template, empty memory files)."""
+    try:
+        MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        for name, text in MEMORY_STUBS.items():
+            p = MEMORY_DIR / name
+            if not p.exists():
+                p.write_text(text, encoding="utf-8")
+        target, example = WORKSPACE / "CLAUDE.md", WORKSPACE / "CLAUDE.example.md"
+        if not target.exists() and example.exists():
+            target.write_text(example.read_text(encoding="utf-8").replace("{HEY_CLAUDE_DIR}", str(HERE)),
+                              encoding="utf-8")
+            log("Created workspace/CLAUDE.md from the template; edit it to make Hey Claude yours.")
+    except Exception as e:
+        log(f"Workspace setup failed: {e!r}")
+
+
 def main():
+    ensure_workspace()
     if "--say" in sys.argv:                          # test the voice
         Voice().say(sys.argv[sys.argv.index("--say") + 1]); return
 
@@ -2248,7 +2595,17 @@ def main():
             print(f"route: {route(cmd)}")
         return
 
-    overlay = Overlay()
+    if "--demo" in sys.argv or not settings()["chat_hud"]:
+        overlay, chatlog = Overlay(), None
+    else:
+        from chatlog import ChatLog
+        chatlog = ChatLog(CONV_DIR, CONTEXT_WINDOW_S, log)
+        try:
+            from hud import Hud
+            overlay = Hud(log=log, chatlog=chatlog)    # status pill + chat window (hud.py)
+        except Exception as e:                         # never leave it without a pill
+            log(f"Chat HUD failed to start ({e!r}); using the plain status pill.")
+            overlay = Overlay()
 
     if "--demo" in sys.argv:                         # walk through the pill's states
         steps = [("listen", "Listening…", "“add this to my tasks and”"), ("think", "Thinking · Sonnet", "“add this to my tasks”"),
@@ -2273,8 +2630,8 @@ def main():
             model = load_whisper()
             fast = load_fast_whisper()
             voice = Voice()
-            lis = Listener(model, voice, overlay, fast_model=fast)
-            overlay.show("done", "Hey Claude is ready", "Say “Hey Claude” and a command", hide_after=3)
+            lis = Listener(model, voice, overlay, fast_model=fast, chatlog=chatlog)
+            overlay.show("done", "Hey Claude is ready", "Say “Hey Claude”, or tap F20 to type", hide_after=3)
             log("Ready.")
             lis.run()
         except Exception as e:

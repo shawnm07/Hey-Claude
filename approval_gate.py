@@ -43,7 +43,8 @@ if fresh:
     TOKEN.unlink(missing_ok=True)                      # one approval = one send
     sys.exit(0)
 
-print("Blocked by the approval lock: pressing Send needs the user's spoken approval first. "
+print("Blocked by the approval lock: pressing Send needs the user's approval first (a clear yes, spoken or "
+      "typed in the chat window). "
       "Ask ONE confirmation question that names the recipient(s), the subject and how it starts, "
       "and wait for a clear yes before trying again.", file=sys.stderr)
 sys.exit(2)
