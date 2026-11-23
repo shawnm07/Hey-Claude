@@ -52,7 +52,7 @@ conversation, or hold **F20** to talk.
 | Push the mouse against the **top-center edge** of the screen | A pill slides down. Move away and it slides back up. |
 | **Hover** the pill | It grows a little to show the latest messages |
 | **Click** the pill, or **tap F20** | Opens the chat window: the full conversation, smooth scrolling, a text box |
-| Type and press **Enter** | Sends it (Shift+Enter for a new line, ↑ for your last message). Typed replies are text-only and may use formatting. |
+| Type and press **Enter** | Sends it (Shift+Enter for a new line, ↑ for your last message). Typed replies are shown as text (with formatting). Ask to hear it ("say it out loud", "read it to me") and it's spoken too. |
 | **Hold F20**, or click the mic | Listens like you said "Hey Claude" (push-to-talk) |
 | Say **"Hey Claude"** with the chat open | The text box becomes a listening panel, then your words and the reply land in the chat |
 | **Stop** under "Working…" | Abandons the request. The model restarts fresh but keeps the conversation as context. |

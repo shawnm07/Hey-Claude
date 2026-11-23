@@ -243,10 +243,21 @@ CATCHUP_HEAD = (
     "conversation, so here is its transcript instead:\n\n"
 )
 TYPED_NOTE = (
-    "(Typed in the chat window, not spoken. Your reply is shown there as text and is NOT read aloud, so it can "
-    "be longer than a spoken reply when that helps, and may use simple formatting: short paragraphs, '-' "
-    "bullets, **bold**, `code`. It is always meant for you: never reply [ignore].)\n"
+    "(Typed in the chat window, not spoken. Your reply is shown there as text and, by default, is not read "
+    "aloud, so it can be longer than a spoken reply when that helps, and may use simple formatting: short "
+    "paragraphs, '-' bullets, **bold**, `code`. If the user wants to HEAR the answer (say it, read it, speak "
+    "it, out loud...), put [speak] anywhere in your reply and it is read aloud with your voice as well as "
+    "shown; write it the way you'd say it. You can always do this: never say you can't speak or read "
+    "something aloud. It is always meant for you: never reply [ignore].)\n"
 )
+# A typed prompt asking to hear the reply ("say it out loud", "read it to me", "speak it"): the reply is
+# spoken too, even if Claude forgets the [speak] tag.
+SPEAK_REQ_RE = re.compile(
+    r"\b(?:out ?loud|aloud|speak (?:it|this|that|the (?:answer|reply)|your (?:answer|reply)|to me|up)|"
+    r"(?:say|read) (?:it|this|that|the (?:answer|reply)|them)(?: (?:back|again|to me|for me))?(?=[\s,.!?]|$)|"
+    r"read (?:it|this|that) (?:to|for) me|tell me verbally|use your voice|(?:with|in) your voice|"
+    r"(?:voice|spoken) (?:reply|answer|response)|let me hear|i want to hear)\b", re.I)
+SPEAK_TAG_RE = re.compile(r"[ \t]*\[speak\][ \t]*", re.I)
 STOPPED = "\x00stopped"          # ClaudeSession.ask() result when the user pressed Stop
 
 # ---- model routing (first match wins; instant local actions are tried before this)
@@ -1265,6 +1276,7 @@ def parse_reply(reply: str):
          [screen] ...    extra detail, appended (still shown AND spoken; implies [keep])
          [silent]        a simple, self-evident action: don't speak, just flash "Done" on the pill
        -> (spoken text, pill text, keep, silent)"""
+    reply = SPEAK_TAG_RE.sub(" ", reply)              # [speak] only matters for typed prompts (see execute)
     silent = bool(re.search(r"\[silent\]", reply, re.I))
     reply = re.sub(r"\s*\[silent\]\s*", " ", reply, flags=re.I).strip()
     keep = bool(re.search(r"\[keep\]", reply, re.I))
@@ -1293,7 +1305,7 @@ def parse_reply(reply: str):
 
 def chat_text(reply: str) -> str:
     """The reply as shown in the chat window: display markers removed, formatting kept."""
-    r = re.sub(r"[ \t]*\[(?:silent|keep|ignore)\][ \t]*", " ", reply or "", flags=re.I)
+    r = re.sub(r"[ \t]*\[(?:silent|keep|ignore|speak)\][ \t]*", " ", reply or "", flags=re.I)
     r = re.sub(r"[ \t]*\[screen\][ \t]*", "\n\n", r, flags=re.I)
     return re.sub(r"[ \t]{2,}", " ", r).strip()
 
@@ -2219,7 +2231,7 @@ class Listener:
             handler, label = model, MODEL_LABEL[model]
             session = self.sessions[model]
             self.ui.show("think", f"Thinking · {label}", f"“{command}”")
-            if not typed:
+            if not typed or SPEAK_REQ_RE.search(command):
                 self.voice.warm(180)                   # speaker stays awake while Claude works
             how = "typed" if typed else "spoken"
             body = f"(The user's {how} answer to your question:) {command}" if is_answer else command
@@ -2268,6 +2280,8 @@ class Listener:
                 self.voice.cool()
                 self.ui.hide()
                 return
+        # typed prompt + "say it out loud" (or Claude tagged the reply [speak]): read the reply aloud too
+        speak_typed = typed and bool(SPEAK_REQ_RE.search(command) or SPEAK_TAG_RE.search(reply))
         text = chat_text(reply)
         self.history.append({"t": time.time(), "handler": handler, "source": source,
                              "command": f"(answer) {command}" if is_answer else command,
@@ -2286,6 +2300,19 @@ class Listener:
             self.chat_question = (handler, spoken, time.time())   # a typed reply in the chat answers it
         self.spoken_reply = spoken
         self.flush()                                   # drop whatever the mic heard while it was thinking
+        if speak_typed and spoken:                     # typed, but asked to hear it: speak, no open mic after
+            log("  Typed prompt asked to hear the reply: speaking it.")
+            self.ui.show("ask" if asked else ("done" if ok else "error"),
+                         "Question" if asked else ("Done" if ok else "Couldn't do that"), shown)
+            self.after_speech = ("typed", keep or asked, shown)
+            self.barge_ring.clear(); self.barge_next = time.time() + BARGE_EVERY_S
+            self.speaking = True
+            self.ui.speaking(True)
+            self.voice.speak(spoken)
+            self.last_activity = time.time()
+            if session is not None and session.turns >= MAX_TURNS:
+                self.rotate(handler, f"{MAX_TURNS} commands")
+            return
         if typed:                                      # text only: no voice, no open mic
             self.voice.cool()
             if silent and ok:
@@ -2327,6 +2354,10 @@ class Listener:
         self.reset_vad(keep_noise=True)                # throw away the tail of our own voice
         kind, extra, shown = self.after_speech or ("done", False, "")
         self.after_speech = None
+        if kind == "typed":                            # a typed prompt's reply, read aloud on request:
+            self.ui.linger(None if extra else settings()["hud_seconds_after_reply"])   # no open mic after
+            self.last_activity = time.time()
+            return
         if kind == "ask":
             self.answer_until, self.answer_model = time.time() + settings()["answer_window_seconds"], extra
             self.ui.show("listen", "Listening for your answer…", shown, kind="answer")
@@ -2378,7 +2409,8 @@ class Listener:
         """On battery the mic opens only for F20 / the mic button: until that command, its reply
         and the follow-up windows after it are over."""
         return bool(time.time() < self.demand_until or self.pending is not None or self.followup_until
-                    or self.answer_until or self.open_until or self.speaking or self.in_speech)
+                    or self.answer_until or self.open_until or self.in_speech
+                    or (self.speaking and not (self.after_speech and self.after_speech[0] == "typed")))
 
     def housekeeping(self):
         """Things that happen whether or not the mic is open (chat, F20, settings, idle end)."""
