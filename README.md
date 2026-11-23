@@ -222,3 +222,7 @@ A few details that took some figuring out:
 - No pill when you push the mouse to the top edge: it only triggers in the middle of the **primary** screen's
   top edge, with no mouse button held.
 - F20 does nothing: another app may already own F20. Check the log for "F20 hotkey unavailable".
+
+## License
+
+[MIT](LICENSE): use it, change it, share it. Just keep the copyright notice.
