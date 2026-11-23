@@ -1,0 +1,15 @@
+{
+  "name": "Spotify play by name",
+  "description": "Play a song, artist, album, playlist (yours first) or the latest podcast episode on Spotify by name, through the Spotify Web API. Needs a one-time setup: run.py --setup <client id>, then run.py --login.",
+  "triggers": [
+    "(?:play|put on|queue up|start playing|listen to|i want to (?:hear|listen to)|let me hear|can i hear) (?!(?:it|that|this|them|something|anything|music|some music|the music|my music|spotify|on spotify)$)(?!.*\\b(?:youtube|netflix|videos?|movies?|twitch|hulu|disney|prime video|browser|chrome|edge)\\b){q}",
+    "(?:spotify,? )?play {q} (?:on|in|from|using) spotify",
+    "spotify,? play {q}"
+  ],
+  "params": {"q": {"type": "text"}},
+  "script": "run.py",
+  "args": ["{q}"],
+  "reply": "[silent] {output}",
+  "approval": false,
+  "timeout": 30
+}

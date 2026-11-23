@@ -22,3 +22,5 @@ voiceprint.json
 headsup-state.json
 headsup/
 duck-state.json
+skills-examples/**/config.json
+skills-examples/**/token.json

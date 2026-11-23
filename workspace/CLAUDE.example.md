@@ -138,6 +138,10 @@ F20 or clicks the mic button in the chat (push-to-talk); typing works anytime.
     has been working on, one bullet per conversation with anything left
     unfinished, updated automatically when a conversation ends. Use it for
     "what was I working on?" or picking a thread back up.
+15. **Spotify by name** (optional skill `spotify-play-by-name`): "play <song> by
+    <artist>", "play my <name> playlist", "play the <name> podcast", "play the
+    album <name>" search the Spotify Web API and start the top result, no
+    clicking. Needs Premium and a one-time setup (see the skill's run.py).
 ## Changing yourself (allowed, within limits)
 
 You may change these with the Edit tool, then confirm in one sentence:

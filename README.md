@@ -90,6 +90,18 @@ built-in instant commands (a PowerShell skill takes ~0.3 s). The chat labels the
 }
 ```
 
+**Spotify by name** ([`skills-examples/spotify-play-by-name`](skills-examples/spotify-play-by-name)): *"play Blank
+Space by Taylor Swift"*, *"play my Study playlist"*, *"play the Pints With Aquinas podcast"*, *"play the album 1989"*,
+*"play some Taylor Swift"*. It searches the Spotify Web API (your own playlists first) and starts the top result on the
+device that's playing, otherwise on this laptop's Spotify app, which it opens if needed. Silent, with no screen clicking.
+It needs Spotify Premium and a one-time setup:
+1. Create a free app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard), with redirect URI
+   `http://127.0.0.1:8888/callback` and the Web API.
+2. Run `run.py --setup <Client ID>`.
+3. Run `run.py --login` (PKCE, no client secret).
+
+The Client ID and the refresh token stay in local, git-ignored files.
+
 Triggers are regular expressions matched against the whole command, and `{n}` captures a parameter (number words
 like "seventy five" work too). `reply` can use `{output}` (what the script printed), or `[silent]` to just flash
 "Done". Two samples ship in [`skills-examples/`](skills-examples): screen brightness and battery status. See
