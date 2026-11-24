@@ -64,6 +64,7 @@ conversation, or hold **F20** to talk.
 | Say **"Hey Claude"** with the chat open | The text box becomes a listening panel, then your words and the reply land in the chat |
 | **Stop** under "Working…" | Abandons the request. The model restarts fresh but keeps the conversation as context. |
 | Gear ⚙ → **New conversation** | Starts a new log. The old one is kept, and memories and settings carry over. |
+| Gear ⚙ → **Restart / Shut down Hey Claude** | Restarts or quits the program (not the computer). Click twice to confirm; it stops anything in progress. After a shutdown it starts again at your next sign-in. |
 | Drag the chat's **title bar**, or drag the **pill** | Moves it anywhere, like a normal window. A click on the pill still opens the chat (right where you moved it). |
 | **X**, **Esc** or **F20** | Closes the chat and puts it (and the pill) back in the middle. Otherwise it stays on top while you work. |
 
@@ -275,6 +276,7 @@ A few details that took some figuring out:
 | `headsup.py` | Proactive heads-ups: battery, calendar events, due tasks |
 | `audioduck.py` | Turns the laptop's volume down while listening, restores it exactly (crash-safe) |
 | `skills-examples/` | Sample skills, copied to `workspace/skills/` on first run |
+| `relaunch.py` | Starts Hey Claude again after *Restart Hey Claude* |
 | `approval_gate.py` | Claude Code `PreToolUse` hook that enforces the email-send approval lock |
 | `tools/` | Gmail compose / send helpers (browser only; no email API access) |
 | `workspace/CLAUDE.example.md` | Template for the assistant's instructions |

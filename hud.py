@@ -79,7 +79,7 @@ HOVER_EXPAND_S = 0.15          # hover the pill this long to see the latest mess
 RETRACT_S = 0.08               # the dropped pill slides away this soon after the mouse leaves
 PEEK_CLICK_GUARD_S = 0.25      # ignore clicks right after the pill drops (aimed at a browser tab)
 
-ICON = dict(gear="", close="", send="", mic="", copy="", stop="",
+ICON = dict(restart="\ue72c", power="\ue7e8", gear="", close="", send="", mic="", copy="", stop="",
             down="", add="", folder="", check="", cancel="", up="")
 
 
@@ -509,15 +509,26 @@ class Hud:
         # settings menu (gear)
         m = self.menu = tk.Frame(c, bg=self.PANEL, highlightthickness=1, highlightbackground=self.BORDER,
                                  highlightcolor=self.BORDER)
-        for icon, text, fn in ((ICON["add"], "New conversation", lambda: (self._close_menu(), self._act("new"))),
-                               (ICON["mic"], "Set up voice match", lambda: (self._close_menu(), self._act("enroll"))),
-                               (ICON["folder"], "Open conversation logs", self._open_logs)):
+        self.confirms, self.confirm_job = {}, None     # action -> (label, normal text); needs a second click
+        for item in ((ICON["add"], "New conversation", lambda: (self._close_menu(), self._act("new"))),
+                     (ICON["mic"], "Set up voice match", lambda: (self._close_menu(), self._act("enroll"))),
+                     (ICON["folder"], "Open conversation logs", self._open_logs),
+                     None,                             # divider
+                     (ICON["restart"], "Restart Hey Claude", "restart"),
+                     (ICON["power"], "Shut down Hey Claude", "shutdown")):
+            if item is None:
+                tk.Frame(m, bg=self.BORDER, height=1).pack(fill="x", pady=px(3))
+                continue
+            icon, text, fn = item
             row = tk.Frame(m, bg=self.PANEL, cursor="hand2")
             row.pack(fill="x")
             a = tk.Label(row, text=icon, font=self.f_icon_m, fg=self.SUB, bg=self.PANEL, padx=px(12), pady=px(9))
             a.pack(side="left")
             t = tk.Label(row, text=text, font=self.f_small, fg=self.FG, bg=self.PANEL, padx=0, pady=px(9))
             t.pack(side="left", padx=(0, px(18)))
+            if isinstance(fn, str):
+                self.confirms[fn] = (t, text)
+                fn = lambda action=fn: self._menu_confirm(action)
             parts = (row, a, t)
             for wdg in parts:
                 wdg.bind("<Enter>", lambda e, ps=parts: [p.config(bg=self.HOVER) for p in ps])
@@ -1256,6 +1267,27 @@ class Hud:
         if self.menu_open:
             self.menu_open = False
             self.menu.place_forget()
+            self._confirm_reset()
+
+    def _menu_confirm(self, action):
+        """Restart / Shut down: the first click only asks, a second one within 4 s does it."""
+        label, text = self.confirms[action]
+        if self.confirm_job and self.confirm_job[0] == action:
+            self._close_menu()
+            self._act(action)
+            return
+        self._confirm_reset()
+        label.config(text="Click again to " + ("restart" if action == "restart" else "shut down"),
+                     fg=self.COLORS.get("error", self.FG))
+        self.confirm_job = (action, self.root.after(4000, self._confirm_reset))
+
+    def _confirm_reset(self):
+        if self.confirm_job:
+            action, job = self.confirm_job
+            self.confirm_job = None
+            self.root.after_cancel(job)
+            label, text = self.confirms[action]
+            label.config(text=text, fg=self.FG)
 
     def _open_logs(self):
         self._close_menu()

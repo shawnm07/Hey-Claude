@@ -32,6 +32,7 @@ Tests: --transcribe file.wav   --say "text"   --demo   --screens
 Log:   hey-claude.log next to this file
 """
 
+import base64
 import collections
 import contextlib
 import ctypes
@@ -1830,6 +1831,9 @@ class Listener:
             self.stop_event.set()
             self.ctrl.put("hush")
             return
+        if action in ("restart", "shutdown"):          # works even if this loop is stuck
+            end_program(self.ui, action, self)
+            return
         self.ctrl.put(action)
 
     def handle_ui_actions(self):
@@ -3327,6 +3331,44 @@ def kill_children_with_me():
         log(f"Job object setup failed: {e!r}")
 
 
+def end_program(ui, action, listener=None):
+    """Gear menu: "Restart Hey Claude" / "Shut down Hey Claude" (this program, never the laptop). The Claude
+    sessions close with it (job object); a conversation that wasn't reviewed yet is reviewed at the next start."""
+    def go():
+        if action == "restart":
+            ui.toast("Restarting…", 15)
+            if not start_relauncher():
+                ui.toast("Couldn't restart (see hey-claude.log).", 5)
+                return
+        log("Restarting (gear menu)." if action == "restart" else "Shutting down (gear menu).")
+        threading.Timer(4, lambda: os._exit(0)).start()      # in case an audio call below hangs
+        if listener is not None:
+            for tidy in (listener.voice.stop, listener.ducker.restore):
+                try:
+                    tidy()
+                except Exception as e:
+                    log(f"Cleaning up before exit: {e!r}")
+        os._exit(0)                                    # exit code 0: Task Scheduler doesn't start it again
+    threading.Thread(target=go, daemon=True).start()
+
+
+def start_relauncher() -> bool:
+    """Have Windows (WMI) start relaunch.py outside our job object, where it outlives us."""
+    line = subprocess.list2cmdline([sys.executable, str(HERE / "relaunch.py"), str(os.getpid())])
+    ps = ("$ErrorActionPreference='Stop'; (Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+          "-Arguments @{CommandLine='" + line.replace("'", "''") + "'}).ReturnValue")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                            base64.b64encode(ps.encode("utf-16-le")).decode()],
+                           capture_output=True, text=True, timeout=20, creationflags=0x08000000)
+        if r.stdout.strip() == "0":
+            return True
+        log(f"Couldn't start the relauncher: {r.stdout.strip()} {r.stderr.strip()[:200]}")
+    except Exception as e:
+        log(f"Couldn't start the relauncher: {e!r}")
+    return False
+
+
 def single_instance() -> bool:
     kernel32.CreateMutexW(None, False, "Local\\HeyClaudeListener")
     return kernel32.GetLastError() != 183
@@ -3474,6 +3516,8 @@ def main():
             log(f"FATAL: {e!r}")
             overlay.quit()
 
+    # until the listener takes over (models still loading), only Restart / Shut down work
+    overlay.on_action = lambda a: end_program(overlay, a) if a in ("restart", "shutdown") else None
     threading.Thread(target=worker, daemon=True).start()
     overlay.root.mainloop()
 
